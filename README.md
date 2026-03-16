@@ -1,95 +1,114 @@
-<div align="center">
-<br>
+<p align="center">
+  <a href="https://dkod.io">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.svg">
+      <img alt="dkod — Agent-native code platform" src=".github/assets/banner-dark.svg" width="100%">
+    </picture>
+  </a>
+</p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://dkod.io/favicon.png">
-  <source media="(prefers-color-scheme: light)" srcset="https://dkod.io/favicon.png">
-  <img alt="dkod" src="https://dkod.io/favicon.png" width="80">
-</picture>
+<p align="center">
+  <b>Multiple AI agents. One codebase. Zero conflicts.</b>
+</p>
 
-<br>
-<br>
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-06b6d4?style=flat-square&labelColor=0f0f14"></a>
+  <a href="https://github.com/dkod-io/dkod-engine"><img alt="Rust" src="https://img.shields.io/badge/rust-1.88+-06b6d4?style=flat-square&labelColor=0f0f14"></a>
+  <a href="https://dkod.io"><img alt="Website" src="https://img.shields.io/badge/dkod.io-website-06b6d4?style=flat-square&labelColor=0f0f14"></a>
+  <a href="https://discord.gg/q2xzuNDJ"><img alt="Discord" src="https://img.shields.io/badge/discord-community-06b6d4?style=flat-square&labelColor=0f0f14"></a>
+  <a href="https://twitter.com/dkod_io"><img alt="Twitter" src="https://img.shields.io/badge/twitter-@dkod__io-06b6d4?style=flat-square&labelColor=0f0f14"></a>
+</p>
 
-<h1>dkod</h1>
-
-<p><strong>The agent-native code platform</strong></p>
-
-<p>
-<sub>Multiple AI agents. One codebase. Zero conflicts.</sub>
+<p align="center">
+  <a href="https://dkod.io/docs">Documentation</a> &nbsp;&bull;&nbsp;
+  <a href="https://dkod.io/docs/getting-started/quickstart">Quickstart</a> &nbsp;&bull;&nbsp;
+  <a href="https://dkod.io/blog">Blog</a> &nbsp;&bull;&nbsp;
+  <a href="https://discord.gg/q2xzuNDJ">Discord</a>
 </p>
 
 <br>
 
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-06b6d4?style=flat-square&labelColor=0f0f14" alt="MIT License"></a>&nbsp;
-<a href="https://dkod.io"><img src="https://img.shields.io/badge/dkod.io-website-06b6d4?style=flat-square&labelColor=0f0f14" alt="Website"></a>&nbsp;
-<a href="https://discord.gg/q2xzuNDJ"><img src="https://img.shields.io/badge/discord-join-06b6d4?style=flat-square&labelColor=0f0f14" alt="Discord"></a>&nbsp;
-<a href="https://twitter.com/dkod_io"><img src="https://img.shields.io/badge/twitter-@dkod__io-06b6d4?style=flat-square&labelColor=0f0f14" alt="Twitter"></a>
+## The Problem
 
-<br>
-<br>
+You deploy 3 AI agents on the same repo. Agent A refactors auth. Agent B adds an endpoint. Agent C writes tests. They all finish in 2 minutes.
 
-<a href="https://dkod.io/docs">Docs</a>&nbsp;&nbsp;·&nbsp;&nbsp;<a href="https://dkod.io/docs/getting-started/quickstart">Quickstart</a>&nbsp;&nbsp;·&nbsp;&nbsp;<a href="https://dkod.io/blog">Blog</a>&nbsp;&nbsp;·&nbsp;&nbsp;<a href="https://discord.gg/q2xzuNDJ">Community</a>
+Then you spend 45 minutes resolving merge conflicts.
 
-<br>
-<br>
+**AI agents are fast. Your infrastructure isn't built for them.**
 
-</div>
+## The Fix
 
----
-
-<br>
-
-> **AI agents are the new default authors of code.**<br>
-> But the infrastructure wasn't built for them — until now.
-
-<br>
-
-dkod lets multiple AI coding agents work on the same repository **simultaneously** — without merge conflicts, file locks, or broken builds. Built for teams running Cursor, Claude Code, Cline, Windsurf, Codex, and any MCP-compatible agent.
+dkod is an open-source platform purpose-built for concurrent AI code collaboration. It replaces the bottleneck — not the agents.
 
 <br>
 
 <table>
 <tr>
-<td width="50%">
+<td width="50%" valign="top">
 
-### &nbsp;&nbsp;Session Isolation
+### Session Isolation
 
-Each agent gets an **isolated workspace overlay**. Writes go to the overlay, reads fall through to the shared base. No clones. No locks. No waiting.
+Each agent gets an isolated workspace overlay on top of the shared repo. Writes go to the overlay, reads fall through to the base.
 
-*10 agents, one repo, zero interference.*
+**No clones. No locks. No waiting.**
+
+10 agents editing simultaneously, each in their own sandbox.
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
-### &nbsp;&nbsp;Semantic Merging
+### Semantic Merging
 
-Conflicts detected at the **symbol level** — functions, types, constants — not line-by-line. Two agents editing different functions in the same file? No conflict.
+Forget line-based diffs. dkod detects conflicts at the **symbol level** — functions, types, constants.
 
-*Your merge tool finally understands code.*
+Two agents editing different functions in the same file? **No conflict.**
+
+Two agents rewriting the same function? Caught instantly, with a precise report.
 
 </td>
 </tr>
 <tr>
-<td width="50%">
+<td width="50%" valign="top">
 
-### &nbsp;&nbsp;Verification Pipeline
+### Verification Pipeline
 
-Every changeset runs through **lint, type-check, and test** gates before merge. Agents get structured feedback and fix issues autonomously.
+Every changeset passes through **lint → type-check → test** gates before it touches main.
 
-*Ship verified code, not hopeful code.*
+Agents get structured failure data — not log dumps — so they fix issues and retry autonomously.
+
+Average time to verified merge: **< 30 seconds.**
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
-### &nbsp;&nbsp;Agent Protocol
+### Agent Protocol
 
-A purpose-built gRPC protocol for AI agents. Connect, write, submit, verify, merge — all through structured machine-readable APIs.
+A gRPC protocol designed for machines, not humans:
 
-`CONNECT → CONTEXT → SUBMIT → VERIFY → MERGE`
+```
+CONNECT → CONTEXT → SUBMIT → VERIFY → MERGE
+```
+
+Structured requests. Structured responses. No parsing logs. No guessing.
+
+Works with any MCP-compatible agent.
 
 </td>
 </tr>
 </table>
+
+<br>
+
+## Supported Agents
+
+<p>
+  <kbd>&nbsp; Cursor &nbsp;</kbd>&nbsp;
+  <kbd>&nbsp; Claude Code &nbsp;</kbd>&nbsp;
+  <kbd>&nbsp; Cline &nbsp;</kbd>&nbsp;
+  <kbd>&nbsp; Windsurf &nbsp;</kbd>&nbsp;
+  <kbd>&nbsp; Codex &nbsp;</kbd>&nbsp;
+  <kbd>&nbsp; Any MCP Agent &nbsp;</kbd>
+</p>
 
 <br>
 
@@ -101,26 +120,24 @@ A purpose-built gRPC protocol for AI agents. Connect, write, submit, verify, mer
 cargo install --git https://github.com/dkod-io/dkod-engine dk-cli
 ```
 
-**Connect to a repository and start coding**
+**Connect and ship**
 
 ```bash
 dk login
-dk init my-org/my-repo --intent "add new feature"
+dk init my-org/my-repo --intent "add user authentication"
 dk cat src/main.rs
-dk add src/main.rs --content "fn main() { ... }"
-dk commit -m "add feature"
+dk add src/main.rs --content "fn main() { /* ... */ }"
+dk commit -m "feat: add auth module"
 dk check
 dk push
 ```
 
-<br>
-
 <details>
-<summary><b>Use with Claude Code / MCP</b></summary>
+<summary>&nbsp;<b>Use with Claude Code (MCP)</b></summary>
 
 <br>
 
-Add to your MCP settings:
+Add to your MCP config:
 
 ```json
 {
@@ -133,97 +150,104 @@ Add to your MCP settings:
 }
 ```
 
-Then use the agent protocol directly:
+Your agent gets these tools:
 
-```
-dk_connect  →  open a session
-dk_context  →  semantic code search
-dk_file_write  →  edit files in your overlay
-dk_submit  →  submit changeset
-dk_verify  →  run verification pipeline
-dk_merge  →  merge to main
-```
+| Tool | Purpose |
+|------|---------|
+| `dk_connect` | Open a session for a repo |
+| `dk_context` | Semantic code search |
+| `dk_file_read` / `dk_file_write` | Read & write files in isolation |
+| `dk_submit` | Submit a changeset |
+| `dk_verify` | Run the verification pipeline |
+| `dk_merge` | Merge verified changes to main |
 
 </details>
 
 <details>
-<summary><b>Use with Cursor / Cline / Windsurf</b></summary>
+<summary>&nbsp;<b>Use with Cursor, Cline, or Windsurf</b></summary>
 
 <br>
 
-Each agent connects through the same MCP bridge. See the [agent setup docs](https://dkod.io/docs) for per-editor configuration.
+Each editor connects through the same MCP bridge. See the [agent setup docs](https://dkod.io/docs) for per-editor instructions.
 
 </details>
+
+<br>
+
+## How It Works
+
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#06b6d4', 'primaryTextColor': '#f0f0f3', 'lineColor': '#06b6d4' }}}%%
+sequenceDiagram
+    participant A as Agent A
+    participant P as dkod
+    participant B as Agent B
+
+    A->>P: connect (repo)
+    B->>P: connect (repo)
+
+    Note over A,P: Isolated overlays created
+
+    A->>P: write auth.rs → submit
+    B->>P: write api.rs → submit
+
+    A->>P: verify ✓ → merge ✓
+    P-->>B: file changed event
+    B->>P: verify ✓ → merge ✓
+
+    Note over A,B: Different symbols — zero conflicts
+```
 
 <br>
 
 ## Architecture
 
 ```
-dkod-engine/
-│
-├── dk-core          Shared types, error handling
-├── dk-engine        Storage: Git layer + semantic graph (tree-sitter, Tantivy)
-├── dk-protocol      Agent Protocol — gRPC server (tonic + CONNECT)
-├── dk-runner        Verification pipeline runner
-├── dk-agent-sdk     Rust SDK for AI agents
-├── dk-cli           CLI — drop-in git alternative
-├── dk-server        Reference server binary
-│
-├── sdk/python       Python SDK
-└── proto/           Protocol buffer definitions
+dkod-engine
+├── dk-core            shared types and error handling
+├── dk-engine          git storage + semantic graph (tree-sitter, tantivy)
+├── dk-protocol        agent protocol grpc server
+├── dk-runner          verification pipeline runner
+├── dk-agent-sdk       rust sdk for building agents
+├── dk-cli             human-facing cli
+├── dk-server          reference server binary
+├── sdk/python         python sdk
+└── proto/             protobuf definitions
 ```
 
-<br>
+## Build
 
-```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#06b6d4', 'primaryTextColor': '#f0f0f3', 'lineColor': '#06b6d4', 'secondaryColor': '#0f0f14', 'tertiaryColor': '#12121a' }}}%%
-sequenceDiagram
-    participant A as Agent A
-    participant P as dkod Platform
-    participant B as Agent B
-
-    A->>P: connect (repo, intent)
-    B->>P: connect (repo, intent)
-    A->>P: file_write (auth.rs)
-    B->>P: file_write (auth.rs)
-    Note over A,B: Different functions — no conflict
-    A->>P: submit → verify → merge ✓
-    P-->>B: watch event (auth.rs changed)
-    B->>P: submit → verify → merge ✓
-```
-
-<br>
-
-## Build from Source
+> **Requires** Rust 1.88+ &bull; PostgreSQL 16+ &bull; protoc
 
 ```bash
-# Requirements: Rust 1.88+, PostgreSQL 16+, protoc
-
-cargo build --workspace       # build everything
-cargo test --workspace        # run tests
+cargo build --workspace
+cargo test --workspace
 ```
+
+<br>
+
+## Contributing
+
+We welcome contributions. See [open issues](https://github.com/dkod-io/dkod-engine/issues) to get started.
 
 <br>
 
 ## Community
 
-<div align="center">
-
-<a href="https://discord.gg/q2xzuNDJ"><img src="https://img.shields.io/badge/Discord-Chat_with_us-06b6d4?style=for-the-badge&labelColor=0f0f14" alt="Discord"></a>&nbsp;&nbsp;
-<a href="https://twitter.com/dkod_io"><img src="https://img.shields.io/badge/Twitter-Follow-06b6d4?style=for-the-badge&labelColor=0f0f14" alt="Twitter"></a>&nbsp;&nbsp;
-<a href="https://github.com/dkod-io/dkod-engine/issues"><img src="https://img.shields.io/badge/GitHub-Issues-06b6d4?style=for-the-badge&labelColor=0f0f14" alt="Issues"></a>
-
-</div>
+<p align="center">
+  <a href="https://discord.gg/q2xzuNDJ"><img src="https://img.shields.io/badge/Discord-Join_the_community-06b6d4?style=for-the-badge&labelColor=0f0f14" alt="Discord"></a>
+  &nbsp;&nbsp;
+  <a href="https://twitter.com/dkod_io"><img src="https://img.shields.io/badge/Twitter-Follow_@dkod__io-06b6d4?style=for-the-badge&labelColor=0f0f14" alt="Twitter"></a>
+</p>
 
 <br>
 
 ## License
 
-MIT — use it, fork it, build with it.
+MIT &mdash; free to use, fork, and build on.
 
 <br>
 
-<div align="center">
-<sub>Built for the age of AI-native development.</sub>
-</div>
+<p align="center">
+  <sub>Built for the age of agent-native development &bull; <a href="https://dkod.io">dkod.io</a></sub>
+</p>
