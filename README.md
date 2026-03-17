@@ -50,7 +50,7 @@ dkod is an open-source platform purpose-built for concurrent AI code collaborati
 
 **This is not a worktree, not a fork, not a workspace, and not a clone for each agent.**
 
-Each agent gets an isolated workspace overlay on top of the shared repo. Writes go to the overlay, reads fall through to the base. dkod uses AST-level symbol tracking (via tree-sitter) to understand exactly which functions, classes, and methods each agent is touching. When two agents edit different functions in the same file, dkod knows at the AST level that these are independent changes — even if git would flag them as line-level conflicts. When agents truly modify the same symbol, dkod detects it in real-time, notifies the agents so they can adapt mid-flight, and shows the user a precise three-way diff at the function level.
+Each agent gets an isolated workspace overlay on top of the shared repo. Writes go to the overlay, reads fall through to the base. dkod uses AST-level symbol tracking (via tree-sitter) to understand exactly which functions, classes, and methods each agent is touching — zero-copy, zero-clone, zero-coordination.
 
 **No clones. No locks. No waiting.**
 
