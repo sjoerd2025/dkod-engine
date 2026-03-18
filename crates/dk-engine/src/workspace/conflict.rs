@@ -5,11 +5,7 @@
 //! resulting symbol tables. Conflicts arise when both sides modify,
 //! add, or remove the *same* symbol.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-
-use dk_core::{FileAnalysis, Symbol};
-
+use crate::conflict::ast_merge;
 use crate::parser::ParserRegistry;
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -67,86 +63,80 @@ pub fn analyze_file_conflict(
     overlay_content: &[u8],
     parser: &ParserRegistry,
 ) -> MergeAnalysis {
-    let path = Path::new(file_path);
+    // Try AST-level three-way merge first. This produces proper merged
+    // content that combines non-overlapping symbol changes from both sides,
+    // instead of returning only one side's content.
+    let base_str = std::str::from_utf8(base_content).ok();
+    let head_str = std::str::from_utf8(head_content).ok();
+    let overlay_str = std::str::from_utf8(overlay_content).ok();
 
-    // Attempt to parse all three versions.
-    let base_parse = parser.parse_file(path, base_content);
-    let head_parse = parser.parse_file(path, head_content);
-    let overlay_parse = parser.parse_file(path, overlay_content);
-
-    match (base_parse, head_parse, overlay_parse) {
-        (Ok(base_fa), Ok(head_fa), Ok(overlay_fa)) => {
-            semantic_analysis(file_path, &base_fa, &head_fa, &overlay_fa, overlay_content)
-        }
-        _ => {
-            // Fallback: byte-level comparison.
-            byte_level_analysis(file_path, base_content, head_content, overlay_content)
-        }
-    }
-}
-
-/// Semantic three-way merge analysis using parsed symbol tables.
-fn semantic_analysis(
-    file_path: &str,
-    base: &FileAnalysis,
-    head: &FileAnalysis,
-    overlay: &FileAnalysis,
-    overlay_content: &[u8],
-) -> MergeAnalysis {
-    let base_syms = symbol_map(&base.symbols);
-    let head_syms = symbol_map(&head.symbols);
-    let overlay_syms = symbol_map(&overlay.symbols);
-
-    // Collect all symbol names across all three versions.
-    let all_names: HashSet<&str> = base_syms
-        .keys()
-        .chain(head_syms.keys())
-        .chain(overlay_syms.keys())
-        .copied()
-        .collect();
-
-    let mut conflicts = Vec::new();
-
-    for name in all_names {
-        let base_sym = base_syms.get(name);
-        let head_sym = head_syms.get(name);
-        let overlay_sym = overlay_syms.get(name);
-
-        let head_change = classify_change(base_sym, head_sym);
-        let overlay_change = classify_change(base_sym, overlay_sym);
-
-        // If both sides made a change to the same symbol, it's a conflict
-        // (unless both changes are identical).
-        if let (Some(their), Some(ours)) = (&head_change, &overlay_change) {
-            // Same kind of change — check if the results are actually identical.
-            if their == ours {
-                // Both added or both modified to the same thing — check content.
-                let identical = match (head_sym, overlay_sym) {
-                    (Some(h), Some(o)) => symbols_equivalent(h, o),
-                    (None, None) => true, // both removed
-                    _ => false,
+    if let (Some(base), Some(head), Some(overlay)) = (base_str, head_str, overlay_str) {
+        match ast_merge::ast_merge(parser, file_path, base, head, overlay) {
+            Ok(result) => {
+                return match result.status {
+                    ast_merge::MergeStatus::Clean => {
+                        // Guard: ast_merge reconstructs files from imports + symbols only.
+                        // Top-level items the parser doesn't classify as symbols (const,
+                        // static, type aliases, mod declarations, crate attributes) are
+                        // silently dropped.  Detect content loss by checking that the
+                        // merged output is at least 80% of the smaller agent version.
+                        // We compare against min(head, overlay) because a legitimate
+                        // large deletion correctly shrinks the output — the guard should
+                        // only fire when the merge result is smaller than even the
+                        // most-deleting agent's output, which is a strong signal that
+                        // ast_merge dropped content it shouldn't have.
+                        // Note: uses `merged * 5 < min * 4` instead of
+                        // `merged * 100 / min < 80` to avoid usize overflow on
+                        // large files (>42 MB on 32-bit hosts).
+                        let merged_len = result.merged_content.len();
+                        let min_agent_len = head.len().min(overlay.len());
+                        if min_agent_len > 0 && merged_len * 5 < min_agent_len * 4 {
+                            byte_level_analysis(
+                                file_path,
+                                base_content,
+                                head_content,
+                                overlay_content,
+                            )
+                        } else {
+                            MergeAnalysis::AutoMerge {
+                                merged_content: result.merged_content.into_bytes(),
+                            }
+                        }
+                    }
+                    ast_merge::MergeStatus::Conflict => MergeAnalysis::Conflict {
+                        conflicts: result
+                            .conflicts
+                            .into_iter()
+                            .map(|c| {
+                                // Infer change kinds from the three-way symbol versions:
+                                // - version_a = head (their), version_b = overlay (our)
+                                // - empty string means the symbol does not exist in that version
+                                let their_change = infer_change_kind(&c.base, &c.version_a);
+                                let our_change = infer_change_kind(&c.base, &c.version_b);
+                                SemanticConflict {
+                                    file_path: file_path.to_string(),
+                                    symbol_name: c.qualified_name,
+                                    our_change,
+                                    their_change,
+                                }
+                            })
+                            .collect(),
+                    },
                 };
-                if identical {
-                    continue; // No conflict — same change on both sides.
-                }
             }
-
-            conflicts.push(SemanticConflict {
-                file_path: file_path.to_string(),
-                symbol_name: name.to_string(),
-                our_change: ours.clone(),
-                their_change: their.clone(),
-            });
+            Err(e) => {
+                tracing::debug!(
+                    file_path,
+                    error = %e,
+                    "ast_merge failed, falling back to byte-level analysis"
+                );
+            }
         }
     }
 
-    if conflicts.is_empty() {
-        MergeAnalysis::AutoMerge {
-            merged_content: overlay_content.to_vec(),
-        }
-    } else {
-        MergeAnalysis::Conflict { conflicts }
-    }
+    // Fallback: byte-level comparison when AST merge is not available
+    // (binary files, unsupported languages, or UTF-8 decode failure).
+    byte_level_analysis(file_path, base_content, head_content, overlay_content)
 }
 
 /// Byte-level fallback when parsing is not available.
@@ -182,41 +172,22 @@ fn byte_level_analysis(
     }
 }
 
-/// Build a map of qualified_name -> Symbol for quick lookup.
-fn symbol_map(symbols: &[Symbol]) -> HashMap<&str, &Symbol> {
-    symbols
-        .iter()
-        .map(|s| (s.qualified_name.as_str(), s))
-        .collect()
-}
-
-/// Classify how a symbol changed from base to the given version.
-fn classify_change(
-    base: Option<&&Symbol>,
-    current: Option<&&Symbol>,
-) -> Option<SymbolChangeKind> {
-    match (base, current) {
-        (None, None) => None,
-        (None, Some(_)) => Some(SymbolChangeKind::Added),
-        (Some(_), None) => Some(SymbolChangeKind::Removed),
-        (Some(b), Some(c)) => {
-            if symbols_equivalent(b, c) {
-                None // unchanged
-            } else {
-                Some(SymbolChangeKind::Modified)
-            }
-        }
+/// Infer the [`SymbolChangeKind`] by comparing a symbol's base version to its
+/// current version.  An empty string means the symbol does not exist in that
+/// version of the file.
+fn infer_change_kind(base: &str, current: &str) -> SymbolChangeKind {
+    match (base.is_empty(), current.is_empty()) {
+        // Symbol absent in base, present now — added
+        (true, false) => SymbolChangeKind::Added,
+        // Symbol present in base, absent now — removed
+        (false, true) => SymbolChangeKind::Removed,
+        // Both present — a genuine modification (content must differ; ast_merge
+        // only emits conflicts when at least one side changed).
+        (false, false) => SymbolChangeKind::Modified,
+        // Both absent — ast_merge never generates this as a conflict; treat as
+        // Modified defensively but this branch should be unreachable.
+        (true, true) => SymbolChangeKind::Modified,
     }
-}
-
-/// Check whether two symbols are semantically equivalent for merge purposes.
-/// We compare span, kind, visibility, and signature — NOT the symbol ID.
-fn symbols_equivalent(a: &Symbol, b: &Symbol) -> bool {
-    a.qualified_name == b.qualified_name
-        && a.kind == b.kind
-        && a.visibility == b.visibility
-        && a.span == b.span
-        && a.signature == b.signature
 }
 
 #[cfg(test)]
@@ -278,45 +249,26 @@ mod tests {
     }
 
     #[test]
-    fn classify_change_cases() {
-        use dk_core::{Span, SymbolKind, Visibility};
-        use std::path::PathBuf;
-        use uuid::Uuid;
+    fn infer_change_kind_added() {
+        assert_eq!(infer_change_kind("", "fn new() {}"), SymbolChangeKind::Added);
+    }
 
-        let sym = Symbol {
-            id: Uuid::new_v4(),
-            name: "f".into(),
-            qualified_name: "f".into(),
-            kind: SymbolKind::Function,
-            visibility: Visibility::Public,
-            file_path: PathBuf::from("t.rs"),
-            span: Span {
-                start_byte: 0,
-                end_byte: 10,
-            },
-            signature: None,
-            doc_comment: None,
-            parent: None,
-            last_modified_by: None,
-            last_modified_intent: None,
-        };
+    #[test]
+    fn infer_change_kind_removed() {
+        assert_eq!(infer_change_kind("fn old() {}", ""), SymbolChangeKind::Removed);
+    }
 
-        // None -> None => no change
-        assert!(classify_change(None, None).is_none());
-
-        // None -> Some => Added
+    #[test]
+    fn infer_change_kind_modified() {
         assert_eq!(
-            classify_change(None, Some(&&sym)),
-            Some(SymbolChangeKind::Added)
+            infer_change_kind("fn foo() { 1 }", "fn foo() { 2 }"),
+            SymbolChangeKind::Modified
         );
+    }
 
-        // Some -> None => Removed
-        assert_eq!(
-            classify_change(Some(&&sym), None),
-            Some(SymbolChangeKind::Removed)
-        );
-
-        // Some -> Some (identical) => no change
-        assert!(classify_change(Some(&&sym), Some(&&sym)).is_none());
+    #[test]
+    fn infer_change_kind_both_empty() {
+        // Edge case: both empty — ast_merge never emits this, but return Modified defensively
+        assert_eq!(infer_change_kind("", ""), SymbolChangeKind::Modified);
     }
 }
