@@ -5,6 +5,7 @@
 //! multiple agent sessions.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use dk_core::{AgentId, RepoId, Result};
@@ -13,6 +14,7 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::workspace::cache::{NoOpCache, WorkspaceCache};
 use crate::workspace::session_workspace::{
     SessionId, SessionWorkspace, WorkspaceMode,
 };
@@ -34,24 +36,50 @@ pub struct SessionInfo {
 
 // ── WorkspaceManager ─────────────────────────────────────────────────
 
+/// Minimum interval between L2 cache touch calls per session.
+const TOUCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Central registry of all active session workspaces.
 ///
 /// Thread-safe via `DashMap`; every public method is either `&self` or
 /// returns a scoped reference guard.
+///
+/// The optional `cache` field holds an [`Arc`]-wrapped [`WorkspaceCache`]
+/// implementation. In single-pod deployments the default [`NoOpCache`] is
+/// used. Multi-pod deployments can supply a `ValkeyCache` (or any other
+/// implementation) via [`WorkspaceManager::with_cache`].
 pub struct WorkspaceManager {
     workspaces: DashMap<SessionId, SessionWorkspace>,
     agent_counters: DashMap<Uuid, AtomicU32>,
     db: PgPool,
+    cache: Arc<dyn WorkspaceCache>,
+    /// Tracks when each session was last touched in L2 cache to debounce.
+    last_touched: DashMap<SessionId, Instant>,
 }
 
 impl WorkspaceManager {
-    /// Create a new, empty workspace manager.
+    /// Create a new, empty workspace manager backed by [`NoOpCache`].
     pub fn new(db: PgPool) -> Self {
+        Self::with_cache(db, Arc::new(NoOpCache))
+    }
+
+    /// Create a workspace manager with an explicit cache implementation.
+    ///
+    /// Use this constructor when a `ValkeyCache` or other L2 cache is
+    /// available. Pass `Arc::new(NoOpCache)` to opt-out of caching.
+    pub fn with_cache(db: PgPool, cache: Arc<dyn WorkspaceCache>) -> Self {
         Self {
             workspaces: DashMap::new(),
             agent_counters: DashMap::new(),
             db,
+            cache,
+            last_touched: DashMap::new(),
         }
+    }
+
+    /// Return a reference to the underlying cache implementation.
+    pub fn cache(&self) -> &dyn WorkspaceCache {
+        self.cache.as_ref()
     }
 
     /// Auto-assign the next agent name for a repository.
@@ -92,6 +120,26 @@ impl WorkspaceManager {
         )
         .await?;
 
+        // Write-through to L2 cache (fire-and-forget — Valkey failure
+        // does not block workspace creation).
+        let snapshot = crate::workspace::cache::WorkspaceSnapshot {
+            session_id: ws.session_id,
+            repo_id: ws.repo_id,
+            agent_id: ws.agent_id.clone(),
+            agent_name: ws.agent_name.clone(),
+            changeset_id: ws.changeset_id,
+            intent: ws.intent.clone(),
+            base_commit: ws.base_commit.clone(),
+            state: ws.state.as_str().to_string(),
+            mode: ws.mode.as_str().to_string(),
+        };
+        let cache = self.cache.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cache.cache_workspace(&session_id, &snapshot).await {
+                tracing::warn!("L2 cache write failed on create: {e}");
+            }
+        });
+
         self.workspaces.insert(session_id, ws);
         Ok(session_id)
     }
@@ -101,7 +149,11 @@ impl WorkspaceManager {
         &self,
         session_id: &SessionId,
     ) -> Option<dashmap::mapref::one::Ref<'_, SessionId, SessionWorkspace>> {
-        self.workspaces.get(session_id)
+        let result = self.workspaces.get(session_id);
+        if result.is_some() {
+            self.touch_in_cache(session_id);
+        }
+        result
     }
 
     /// Get a mutable reference to a workspace.
@@ -109,11 +161,55 @@ impl WorkspaceManager {
         &self,
         session_id: &SessionId,
     ) -> Option<dashmap::mapref::one::RefMut<'_, SessionId, SessionWorkspace>> {
-        self.workspaces.get_mut(session_id)
+        let result = self.workspaces.get_mut(session_id);
+        if result.is_some() {
+            self.touch_in_cache(session_id);
+        }
+        result
+    }
+
+    /// Fire-and-forget L2 cache eviction for one or more session IDs.
+    /// Safe to call from sync contexts — silently skips if no Tokio runtime.
+    fn evict_from_cache(&self, session_ids: &[SessionId]) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            for &sid in session_ids {
+                let cache = self.cache.clone();
+                handle.spawn(async move {
+                    if let Err(e) = cache.evict(&sid).await {
+                        tracing::warn!("L2 cache evict failed: {e}");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Fire-and-forget L2 cache TTL refresh.
+    /// Prevents cache entries from expiring during long-lived sessions.
+    fn touch_in_cache(&self, session_id: &SessionId) {
+        let now = Instant::now();
+        let should_touch = self
+            .last_touched
+            .get(session_id)
+            .is_none_or(|t| now.duration_since(*t) > TOUCH_DEBOUNCE);
+        if !should_touch {
+            return;
+        }
+        self.last_touched.insert(*session_id, now);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let sid = *session_id;
+            let cache = self.cache.clone();
+            handle.spawn(async move {
+                if let Err(e) = cache.touch(&sid).await {
+                    tracing::warn!("L2 cache touch failed: {e}");
+                }
+            });
+        }
     }
 
     /// Remove and drop a workspace.
     pub fn destroy_workspace(&self, session_id: &SessionId) -> Option<SessionWorkspace> {
+        self.last_touched.remove(session_id);
+        self.evict_from_cache(&[*session_id]);
         self.workspaces.remove(session_id).map(|(_, ws)| ws)
     }
 
@@ -164,8 +260,10 @@ impl WorkspaceManager {
         });
 
         for sid in &expired {
+            self.last_touched.remove(sid);
             self.workspaces.remove(sid);
         }
+        self.evict_from_cache(&expired);
 
         expired
     }
@@ -177,9 +275,11 @@ impl WorkspaceManager {
             .filter(|entry| !active_session_ids.contains(entry.key()))
             .map(|entry| *entry.key())
             .collect();
-        for sid in to_remove {
-            self.workspaces.remove(&sid);
+        for sid in &to_remove {
+            self.last_touched.remove(sid);
+            self.workspaces.remove(sid);
         }
+        self.evict_from_cache(&to_remove);
     }
 
     /// Remove workspaces that are idle beyond `idle_ttl` or alive beyond `max_ttl`.
@@ -206,6 +306,10 @@ impl WorkspaceManager {
                 true // keep
             }
         });
+        for sid in &expired {
+            self.last_touched.remove(sid);
+        }
+        self.evict_from_cache(&expired);
 
         expired
     }
