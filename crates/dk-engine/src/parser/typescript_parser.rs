@@ -87,7 +87,52 @@ impl TypeScriptParser {
             "type_alias_declaration" => Some(SymbolKind::TypeAlias),
             "enum_declaration" => Some(SymbolKind::Enum),
             "lexical_declaration" => Some(SymbolKind::Const),
+            "expression_statement" => Some(SymbolKind::Const),
             _ => None,
+        }
+    }
+
+    /// Derive a symbol name from a top-level expression_statement.
+    ///
+    /// Handles common patterns like:
+    /// - `router.get("/path", ...)` → "router.get:/path"
+    /// - `app.use(middleware)` → "app.use"
+    /// - `module.exports = ...` → "module.exports"
+    fn expression_statement_name(node: &Node, source: &[u8]) -> Option<String> {
+        let child = node.child(0)?;
+        match child.kind() {
+            "call_expression" => {
+                let func = child.child_by_field_name("function")?;
+                let func_text = Self::node_text(&func, source).to_string();
+                // For router.get("/path", ...), extract the route path from first arg
+                let args = child.child_by_field_name("arguments")?;
+                let mut cursor = args.walk();
+                for arg_child in args.children(&mut cursor) {
+                    if arg_child.kind() == "string" || arg_child.kind() == "template_string" {
+                        let path = Self::node_text(&arg_child, source)
+                            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                            .to_string();
+                        return Some(format!("{func_text}:{path}"));
+                    }
+                }
+                Some(func_text)
+            }
+            "assignment_expression" => {
+                let left = child.child_by_field_name("left")?;
+                Some(Self::node_text(&left, source).to_string())
+            }
+            _ => {
+                // Fallback: use first line trimmed
+                let text = Self::node_text(&child, source);
+                let first_line = text.lines().next()?;
+                let name = first_line.trim();
+                if name.chars().count() > 60 {
+                    let truncated: String = name.chars().take(57).collect();
+                    Some(format!("{truncated}..."))
+                } else {
+                    Some(name.to_string())
+                }
+            }
         }
     }
 
@@ -120,6 +165,31 @@ impl TypeScriptParser {
             Some(k) => k,
             None => return vec![],
         };
+
+        // For expression_statement (e.g. router.get(...)), derive name from the expression
+        if node.kind() == "expression_statement" {
+            let name = match Self::expression_statement_name(node, source) {
+                Some(n) if !n.is_empty() => n,
+                _ => return vec![],
+            };
+            return vec![Symbol {
+                id: Uuid::new_v4(),
+                name: name.clone(),
+                qualified_name: name,
+                kind: SymbolKind::Const,
+                visibility,
+                file_path: file_path.to_path_buf(),
+                span: Span {
+                    start_byte: node.start_byte() as u32,
+                    end_byte: node.end_byte() as u32,
+                },
+                signature: Self::node_signature(node, source),
+                doc_comment: Self::doc_comments(node, source),
+                parent: None,
+                last_modified_by: None,
+                last_modified_intent: None,
+            }];
+        }
 
         // For lexical_declaration (const/let/var), extract variable names
         if node.kind() == "lexical_declaration" {
@@ -469,8 +539,11 @@ impl LanguageParser for TypeScriptParser {
         for node in root.children(&mut cursor) {
             match node.kind() {
                 "export_statement" => {
-                    // Exported declaration: unwrap to find the inner declaration
+                    // Exported declaration: unwrap to find the inner declaration.
+                    // Also capture bare export statements (e.g. `export default router;`)
+                    // as symbols so they survive AST merge reconstruction.
                     let mut inner_cursor = node.walk();
+                    let mut found_inner = false;
                     for child in node.children(&mut inner_cursor) {
                         if Self::map_symbol_kind(child.kind()).is_some() {
                             symbols.extend(Self::extract_symbol(
@@ -479,7 +552,39 @@ impl LanguageParser for TypeScriptParser {
                                 file_path,
                                 Visibility::Public,
                             ));
+                            found_inner = true;
                         }
+                    }
+                    if !found_inner {
+                        // Bare export (e.g. `export default router;`) — treat the
+                        // entire export_statement as a Const symbol. Extract the
+                        // exported identifier from the tree for a stable name.
+                        let name = node
+                            .child_by_field_name("declaration")
+                            .or_else(|| node.child_by_field_name("value"))
+                            .map(|n| Self::node_text(&n, source).trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| {
+                                let text = Self::node_text(&node, source);
+                                text.lines().next().unwrap_or("export").trim().to_string()
+                            });
+                        symbols.push(Symbol {
+                            id: Uuid::new_v4(),
+                            name: name.clone(),
+                            qualified_name: name,
+                            kind: SymbolKind::Const,
+                            visibility: Visibility::Public,
+                            file_path: file_path.to_path_buf(),
+                            span: Span {
+                                start_byte: node.start_byte() as u32,
+                                end_byte: node.end_byte() as u32,
+                            },
+                            signature: Self::node_signature(&node, source),
+                            doc_comment: Self::doc_comments(&node, source),
+                            parent: None,
+                            last_modified_by: None,
+                            last_modified_intent: None,
+                        });
                     }
                 }
                 kind if Self::map_symbol_kind(kind).is_some() => {
@@ -492,6 +597,19 @@ impl LanguageParser for TypeScriptParser {
                     ));
                 }
                 _ => {}
+            }
+        }
+
+        // Deduplicate qualified_names to prevent BTreeMap key collisions in
+        // ast_merge (which silently drops earlier entries with the same key).
+        // Common case: multiple `app.use(...)` calls all resolve to "app.use".
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for sym in &mut symbols {
+            let count = seen.entry(sym.qualified_name.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                sym.qualified_name = format!("{}#{}", sym.qualified_name, count);
+                sym.name = sym.qualified_name.clone();
             }
         }
 
