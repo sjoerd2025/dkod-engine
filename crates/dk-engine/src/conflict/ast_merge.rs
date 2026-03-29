@@ -4,7 +4,7 @@
 //! that is NOT a conflict even if line numbers shifted. Only same-symbol
 //! modifications across sessions are TRUE conflicts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use dk_core::{Error, Result, Symbol};
@@ -45,7 +45,7 @@ struct SymbolSpan {
     kind: String,
     /// The full source text of the symbol (including doc comments captured by the span).
     text: String,
-    /// Original ordering index so we can reconstruct file order.
+    /// Original ordering index (reserved for future use).
     _order: usize,
 }
 
@@ -166,13 +166,32 @@ pub fn ast_merge(
     let b_map: BTreeMap<&str, &SymbolSpan> =
         b_spans.iter().map(|s| (s.qualified_name.as_str(), s)).collect();
 
-    // Collect all unique symbol names across the three versions
-    let all_names: BTreeSet<&str> = base_map
-        .keys()
-        .chain(a_map.keys())
-        .chain(b_map.keys())
-        .copied()
-        .collect();
+    // Build ordered name list: base order first, then new symbols from A and B.
+    // This preserves the original file layout instead of alphabetizing.
+    let mut all_names: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    // Base symbols in their original order
+    for span in &base_spans {
+        let name = span.qualified_name.as_str();
+        if seen.insert(name) {
+            all_names.push(name);
+        }
+    }
+    // New symbols from A (in their file order)
+    for span in &a_spans {
+        let name = span.qualified_name.as_str();
+        if seen.insert(name) {
+            all_names.push(name);
+        }
+    }
+    // New symbols from B (in their file order)
+    for span in &b_spans {
+        let name = span.qualified_name.as_str();
+        if seen.insert(name) {
+            all_names.push(name);
+        }
+    }
 
     let mut merged_symbols: Vec<SymbolSpan> = Vec::new();
     let mut conflicts: Vec<SymbolConflict> = Vec::new();
@@ -333,18 +352,22 @@ pub fn ast_merge(
         }
     }
 
-    // Merge imports additively (union, deduplicated)
-    let mut merged_import_set: BTreeSet<String> = BTreeSet::new();
+    // Merge imports additively (union, deduplicated, preserving base order)
+    let mut merged_imports: Vec<String> = Vec::new();
+    let mut import_seen: HashSet<String> = HashSet::new();
+    // Base imports first (original order), then new imports from A and B
     for imp in base_imports.iter().chain(a_imports.iter()).chain(b_imports.iter()) {
-        merged_import_set.insert(imp.text.clone());
+        if import_seen.insert(imp.text.clone()) {
+            merged_imports.push(imp.text.clone());
+        }
     }
 
     // Reconstruct the file
     let mut output = String::new();
 
-    // Imports first
-    if !merged_import_set.is_empty() {
-        for imp in &merged_import_set {
+    // Imports first (in preserved order)
+    if !merged_imports.is_empty() {
+        for imp in &merged_imports {
             output.push_str(imp);
             output.push('\n');
         }
