@@ -38,30 +38,30 @@ pub async fn handle_file_write(
         .get_workspace(&sid)
         .ok_or_else(|| Status::not_found("Workspace not found for session"))?;
 
-    // Determine if the file is new (not in base tree) synchronously,
-    // then drop the git_repo before async work to keep future Send.
-    // Capture repo_id here to avoid a redundant second get_repo call later.
-    let (repo_id, is_new) = {
+    // Determine if the file is new (not in base tree) and read old content
+    // in a single get_repo call. Drop git_repo before async work to keep
+    // future Send.
+    let (repo_id, is_new, old_content) = {
         let (rid, git_repo) = engine
             .get_repo(&session.codebase)
             .await
             .map_err(|e| Status::internal(format!("Repo error: {e}")))?;
-        let new = git_repo
-            .read_tree_entry(&ws.base_commit, &req.path)
-            .is_err();
-        (rid, new)
+        match git_repo.read_tree_entry(&ws.base_commit, &req.path) {
+            Ok(bytes) => (rid, false, bytes),
+            Err(e) => {
+                // File not in base tree — treat as new. Log the error in case
+                // it's a transient git failure rather than a genuine "not found".
+                warn!(
+                    path = %req.path,
+                    base_commit = %ws.base_commit,
+                    error = %e,
+                    "read_tree_entry failed — treating file as new"
+                );
+                (rid, true, Vec::new())
+            }
+        }
     };
     let repo_id_str = repo_id.to_string();
-
-    // Capture pre-write symbols for accurate change detection
-    let pre_write_symbols: std::collections::HashSet<String> = engine
-        .symbol_store()
-        .find_by_file(repo_id, &req.path)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.qualified_name)
-        .collect();
 
     // Write through the overlay (async DB persist)
     let new_hash = ws
@@ -84,49 +84,10 @@ pub async fn handle_file_write(
         .upsert_file(changeset_id, &req.path, op, content_str)
         .await;
 
-    // Attempt to detect symbol changes by parsing the new content
-    let detected_changes = detect_symbol_changes(engine, &req.path, &req.content);
-
-    // Build symbol change details with accurate change types by comparing
-    // against pre-write symbols.
-    let symbol_changes: Vec<crate::SymbolChangeDetail> = detected_changes
-        .iter()
-        .map(|sc| {
-            let change_type = if is_new || !pre_write_symbols.contains(&sc.symbol_name) {
-                "added"
-            } else {
-                "modified"
-            };
-            crate::SymbolChangeDetail {
-                symbol_name: sc.symbol_name.clone(),
-                file_path: req.path.clone(),
-                change_type: change_type.to_string(),
-                kind: sc.change_type.clone(),
-            }
-        })
-        .collect();
-
-    // Detect deleted symbols (existed before but no longer present).
-    // Only infer deletions when the parser produced output — if parsing
-    // failed (e.g. incomplete syntax mid-edit), detected_changes is empty
-    // and we'd falsely report every pre-existing symbol as deleted.
-    let mut all_symbol_changes = symbol_changes;
-    if !detected_changes.is_empty() {
-        let detected_names: std::collections::HashSet<&str> = detected_changes
-            .iter()
-            .map(|sc| sc.symbol_name.as_str())
-            .collect();
-        for name in &pre_write_symbols {
-            if !detected_names.contains(name.as_str()) {
-                all_symbol_changes.push(crate::SymbolChangeDetail {
-                    symbol_name: name.clone(),
-                    file_path: req.path.clone(),
-                    change_type: "deleted".to_string(),
-                    kind: String::new(),
-                });
-            }
-        }
-    }
+    // Detect symbol changes by diffing old vs new file content.
+    // Only symbols whose source text actually changed are reported.
+    let (detected_changes, all_symbol_changes) =
+        detect_symbol_changes_diffed(engine, &req.path, &old_content, &req.content, is_new);
 
     // ── Symbol claim tracking ──
     // Build claims from "added" and "modified" symbol changes and check for
@@ -224,31 +185,163 @@ pub async fn handle_file_write(
     }))
 }
 
-/// Parse the file content and detect symbol-level changes.
+/// Parse both old and new file content, diff per-symbol source text,
+/// and return only symbols that actually changed.
 ///
-/// This is best-effort: if the parser doesn't support the file type
-/// or parsing fails, we return an empty list.
-fn detect_symbol_changes(
+/// Returns `(detected_changes, all_symbol_change_details)`:
+/// - `detected_changes`: `SymbolChange` for the gRPC response (only truly changed symbols)
+/// - `all_symbol_change_details`: `SymbolChangeDetail` for claims + events (added/modified/deleted)
+fn detect_symbol_changes_diffed(
     engine: &dk_engine::repo::Engine,
     path: &str,
-    content: &[u8],
-) -> Vec<SymbolChange> {
+    old_content: &[u8],
+    new_content: &[u8],
+    is_new_file: bool,
+) -> (Vec<SymbolChange>, Vec<crate::SymbolChangeDetail>) {
     let file_path = std::path::Path::new(path);
     let parser = engine.parser();
 
     if !parser.supports_file(file_path) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
-    match parser.parse_file(file_path, content) {
-        Ok(analysis) => analysis
-            .symbols
+    // Parse new file
+    let new_symbols = match parser.parse_file(file_path, new_content) {
+        Ok(analysis) => analysis.symbols,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+
+    // If file is new, all symbols are "added"
+    if is_new_file || old_content.is_empty() {
+        let changes: Vec<SymbolChange> = new_symbols
             .iter()
             .map(|sym| SymbolChange {
                 symbol_name: sym.qualified_name.clone(),
                 change_type: sym.kind.to_string(),
             })
-            .collect(),
-        Err(_) => Vec::new(),
+            .collect();
+        let details: Vec<crate::SymbolChangeDetail> = new_symbols
+            .iter()
+            .map(|sym| crate::SymbolChangeDetail {
+                symbol_name: sym.qualified_name.clone(),
+                file_path: path.to_string(),
+                change_type: "added".to_string(),
+                kind: sym.kind.to_string(),
+            })
+            .collect();
+        return (changes, details);
     }
+
+    // Parse old file to get baseline symbols
+    let old_symbols = match parser.parse_file(file_path, old_content) {
+        Ok(analysis) => analysis.symbols,
+        Err(_) => {
+            // Can't parse old file — fall back to treating all new symbols as modified
+            let changes: Vec<SymbolChange> = new_symbols
+                .iter()
+                .map(|sym| SymbolChange {
+                    symbol_name: sym.qualified_name.clone(),
+                    change_type: sym.kind.to_string(),
+                })
+                .collect();
+            let details: Vec<crate::SymbolChangeDetail> = new_symbols
+                .iter()
+                .map(|sym| crate::SymbolChangeDetail {
+                    symbol_name: sym.qualified_name.clone(),
+                    file_path: path.to_string(),
+                    change_type: "modified".to_string(),
+                    kind: sym.kind.to_string(),
+                })
+                .collect();
+            return (changes, details);
+        }
+    };
+
+    // Build a map of old symbol qualified_name → source text.
+    // Use entry().or_insert() to keep the first occurrence when duplicate
+    // qualified names exist (e.g., overloaded methods in Java/Kotlin/C#).
+    let mut old_symbol_text: std::collections::HashMap<&str, &[u8]> = std::collections::HashMap::new();
+    for sym in &old_symbols {
+        let start = sym.span.start_byte as usize;
+        let end = sym.span.end_byte as usize;
+        if start <= end && end <= old_content.len() {
+            old_symbol_text.entry(sym.qualified_name.as_str()).or_insert(&old_content[start..end]);
+        }
+    }
+
+    let mut detected_changes = Vec::new();
+    let mut all_details = Vec::new();
+
+    // Deduplicate new symbols while preserving original parse order.
+    let mut seen_new: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // Compare each deduplicated new symbol against its old version
+    for sym in &new_symbols {
+        if !seen_new.insert(sym.qualified_name.as_str()) {
+            continue; // duplicate qualified name — already handled
+        }
+        let start = sym.span.start_byte as usize;
+        let end = sym.span.end_byte as usize;
+        let new_text = if start <= end && end <= new_content.len() {
+            &new_content[start..end]
+        } else {
+            continue; // invalid or inverted span, skip
+        };
+
+        match old_symbol_text.get(sym.qualified_name.as_str()) {
+            None => {
+                // Symbol not in old file — added
+                detected_changes.push(SymbolChange {
+                    symbol_name: sym.qualified_name.clone(),
+                    change_type: sym.kind.to_string(),
+                });
+                all_details.push(crate::SymbolChangeDetail {
+                    symbol_name: sym.qualified_name.clone(),
+                    file_path: path.to_string(),
+                    change_type: "added".to_string(),
+                    kind: sym.kind.to_string(),
+                });
+            }
+            Some(old_text) => {
+                if *old_text != new_text {
+                    // Symbol text changed — modified
+                    detected_changes.push(SymbolChange {
+                        symbol_name: sym.qualified_name.clone(),
+                        change_type: sym.kind.to_string(),
+                    });
+                    all_details.push(crate::SymbolChangeDetail {
+                        symbol_name: sym.qualified_name.clone(),
+                        file_path: path.to_string(),
+                        change_type: "modified".to_string(),
+                        kind: sym.kind.to_string(),
+                    });
+                }
+                // else: symbol text identical — skip (no claim needed)
+            }
+        }
+    }
+
+    // Detect deleted symbols (deduplicated to avoid double-reporting overloads)
+    let new_names: std::collections::HashSet<&str> = new_symbols
+        .iter()
+        .map(|s| s.qualified_name.as_str())
+        .collect();
+    let old_names: std::collections::HashSet<&str> = old_symbols
+        .iter()
+        .map(|s| s.qualified_name.as_str())
+        .collect();
+    for old_name in &old_names {
+        if !new_names.contains(old_name) {
+            if let Some(old_sym) = old_symbols.iter().find(|s| s.qualified_name.as_str() == *old_name) {
+                all_details.push(crate::SymbolChangeDetail {
+                    symbol_name: old_sym.qualified_name.clone(),
+                    file_path: path.to_string(),
+                    change_type: "deleted".to_string(),
+                    kind: old_sym.kind.to_string(),
+                });
+            }
+        }
+    }
+
+    (detected_changes, all_details)
 }
