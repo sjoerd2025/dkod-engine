@@ -1,17 +1,19 @@
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use std::time::Instant;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use dk_core::SymbolKind;
 
 /// A claim that a particular session has touched a symbol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolClaim {
     pub session_id: Uuid,
     pub agent_name: String,
     pub qualified_name: String,
     pub kind: SymbolKind,
-    pub first_touched_at: Instant,
+    pub first_touched_at: DateTime<Utc>,
 }
 
 /// Information about a detected conflict: another session already claims
@@ -22,7 +24,7 @@ pub struct ConflictInfo {
     pub kind: SymbolKind,
     pub conflicting_session: Uuid,
     pub conflicting_agent: String,
-    pub first_touched_at: Instant,
+    pub first_touched_at: DateTime<Utc>,
 }
 
 /// Information about a symbol lock held by another session.
@@ -33,7 +35,7 @@ pub struct SymbolLocked {
     pub kind: SymbolKind,
     pub locked_by_session: Uuid,
     pub locked_by_agent: String,
-    pub locked_since: Instant,
+    pub locked_since: DateTime<Utc>,
     pub file_path: String,
 }
 
@@ -56,6 +58,71 @@ pub struct ReleasedLock {
     pub agent_name: String,
 }
 
+// ---------------------------------------------------------------------------
+// ClaimTracker trait
+// ---------------------------------------------------------------------------
+
+/// Async trait for symbol-level claim tracking across sessions.
+///
+/// Implementations:
+/// - [`LocalClaimTracker`] — in-memory DashMap (single-pod / tests)
+/// - `ValkeyClaimTracker` — Valkey/Redis-backed (multi-pod, behind `valkey` feature)
+#[async_trait]
+pub trait ClaimTracker: Send + Sync {
+    /// Record a symbol claim (non-blocking — does not reject on conflict).
+    async fn record_claim(&self, repo_id: Uuid, file_path: &str, claim: SymbolClaim);
+
+    /// Attempt to acquire a symbol lock. Returns `Err(SymbolLocked)` if
+    /// another session already holds the symbol.
+    async fn acquire_lock(
+        &self,
+        repo_id: Uuid,
+        file_path: &str,
+        claim: SymbolClaim,
+    ) -> Result<AcquireOutcome, SymbolLocked>;
+
+    /// Release a single symbol lock for a session in a specific file.
+    async fn release_lock(
+        &self,
+        repo_id: Uuid,
+        file_path: &str,
+        session_id: Uuid,
+        qualified_name: &str,
+    );
+
+    /// Release all locks held by a session for a specific repo.
+    async fn release_locks(&self, repo_id: Uuid, session_id: Uuid) -> Vec<ReleasedLock>;
+
+    /// Check whether any of the given symbols conflict with another session.
+    async fn check_conflicts(
+        &self,
+        repo_id: Uuid,
+        file_path: &str,
+        session_id: Uuid,
+        qualified_names: &[String],
+    ) -> Vec<ConflictInfo>;
+
+    /// Return all conflicts for a session across all file paths.
+    ///
+    /// This method is only meaningful for the non-blocking `record_claim` path
+    /// where multiple sessions can record overlapping claims without rejection.
+    /// Backends that use exclusive locking (e.g. `ValkeyClaimTracker`) may
+    /// return an empty list since cross-session conflicts are prevented at
+    /// write time by `acquire_lock`.
+    async fn get_all_conflicts_for_session(
+        &self,
+        repo_id: Uuid,
+        session_id: Uuid,
+    ) -> Vec<(String, ConflictInfo)>;
+
+    /// Remove all claims belonging to a session across ALL repos.
+    async fn clear_session(&self, session_id: Uuid) -> Vec<ReleasedLock>;
+}
+
+// ---------------------------------------------------------------------------
+// LocalClaimTracker — in-memory DashMap implementation
+// ---------------------------------------------------------------------------
+
 /// Thread-safe, lock-free tracker for symbol-level claims across sessions.
 ///
 /// Key insight: two sessions modifying DIFFERENT symbols in the same file is
@@ -65,46 +132,43 @@ pub struct ReleasedLock {
 /// The tracker is keyed by `(repo_id, file_path)` and stores a `Vec<SymbolClaim>`
 /// for each file. DashMap provides fine-grained per-shard locking so reads are
 /// effectively lock-free when not contending on the same shard.
-pub struct SymbolClaimTracker {
+pub struct LocalClaimTracker {
     /// Map from (repo_id, file_path) to the list of claims on that file.
     claims: DashMap<(Uuid, String), Vec<SymbolClaim>>,
 }
 
-impl SymbolClaimTracker {
-    /// Create a new, empty tracker.
+impl LocalClaimTracker {
     pub fn new() -> Self {
         Self {
             claims: DashMap::new(),
         }
     }
+}
 
-    /// Record a symbol claim. If the same session already claims the same
-    /// `qualified_name` in the same file, the existing claim is updated
-    /// (not duplicated).
-    pub fn record_claim(&self, repo_id: Uuid, file_path: &str, claim: SymbolClaim) {
+impl Default for LocalClaimTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ClaimTracker for LocalClaimTracker {
+    async fn record_claim(&self, repo_id: Uuid, file_path: &str, claim: SymbolClaim) {
         let key = (repo_id, file_path.to_string());
         let mut entry = self.claims.entry(key).or_default();
         let claims = entry.value_mut();
 
-        // Deduplicate: same session + same qualified_name → update in place
         if let Some(existing) = claims.iter_mut().find(|c| {
             c.session_id == claim.session_id && c.qualified_name == claim.qualified_name
         }) {
             existing.kind = claim.kind;
             existing.agent_name = claim.agent_name;
-            // Keep the original first_touched_at
         } else {
             claims.push(claim);
         }
     }
 
-    /// Attempt to acquire a symbol lock. If the symbol is already claimed by
-    /// another session, returns `Err(SymbolLocked)` — the write MUST NOT proceed.
-    /// If claimed by the same session, or unclaimed, acquires and returns `Ok(())`.
-    ///
-    /// This is the blocking counterpart to `record_claim`. Use this when writes
-    /// should be rejected if another agent holds the symbol.
-    pub fn acquire_lock(
+    async fn acquire_lock(
         &self,
         repo_id: Uuid,
         file_path: &str,
@@ -114,7 +178,6 @@ impl SymbolClaimTracker {
         let mut entry = self.claims.entry(key).or_default();
         let claims = entry.value_mut();
 
-        // Check if another session already holds this symbol
         if let Some(existing) = claims.iter().find(|c| {
             c.qualified_name == claim.qualified_name && c.session_id != claim.session_id
         }) {
@@ -128,7 +191,6 @@ impl SymbolClaimTracker {
             });
         }
 
-        // Same session re-acquisition — update metadata, return ReAcquired
         if let Some(existing) = claims.iter_mut().find(|c| {
             c.session_id == claim.session_id && c.qualified_name == claim.qualified_name
         }) {
@@ -137,14 +199,11 @@ impl SymbolClaimTracker {
             return Ok(AcquireOutcome::ReAcquired);
         }
 
-        // Fresh claim
         claims.push(claim);
         Ok(AcquireOutcome::Fresh)
     }
 
-    /// Release a single symbol lock for a session in a specific file.
-    /// Used to roll back partially-acquired locks when a batch fails.
-    pub fn release_lock(
+    async fn release_lock(
         &self,
         repo_id: Uuid,
         file_path: &str,
@@ -157,13 +216,10 @@ impl SymbolClaimTracker {
                 !(c.session_id == session_id && c.qualified_name == qualified_name)
             });
         }
-        // Clean up empty entries to prevent unbounded growth from repeated rollbacks
         self.claims.remove_if(&key, |_, v| v.is_empty());
     }
 
-    /// Release all locks held by a session and return what was released.
-    /// Callers should emit `symbol.lock.released` events for each returned entry.
-    pub fn release_locks(&self, repo_id: Uuid, session_id: Uuid) -> Vec<ReleasedLock> {
+    async fn release_locks(&self, repo_id: Uuid, session_id: Uuid) -> Vec<ReleasedLock> {
         let mut released = Vec::new();
         let mut empty_keys = Vec::new();
 
@@ -175,7 +231,6 @@ impl SymbolClaimTracker {
             let file_path = &key.1;
             let claims = entry.value_mut();
 
-            // Collect released locks before removing
             for claim in claims.iter().filter(|c| c.session_id == session_id) {
                 released.push(ReleasedLock {
                     file_path: file_path.clone(),
@@ -198,10 +253,7 @@ impl SymbolClaimTracker {
         released
     }
 
-    /// Check whether any of the given `qualified_names` are already claimed by
-    /// a session other than `session_id`. Returns a `ConflictInfo` for each
-    /// conflicting symbol.
-    pub fn check_conflicts(
+    async fn check_conflicts(
         &self,
         repo_id: Uuid,
         file_path: &str,
@@ -224,7 +276,6 @@ impl SymbolClaimTracker {
                         conflicting_agent: claim.agent_name.clone(),
                         first_touched_at: claim.first_touched_at,
                     });
-                    // Only report the first conflicting session per symbol
                     break;
                 }
             }
@@ -232,11 +283,7 @@ impl SymbolClaimTracker {
         conflicts
     }
 
-    /// Return all conflicts for a given session across ALL file paths.
-    ///
-    /// This checks every tracked file to find symbols where `session_id` has
-    /// a claim AND another session also claims the same symbol.
-    pub fn get_all_conflicts_for_session(
+    async fn get_all_conflicts_for_session(
         &self,
         repo_id: Uuid,
         session_id: Uuid,
@@ -249,14 +296,12 @@ impl SymbolClaimTracker {
             }
             let claims = entry.value();
 
-            // Find symbols claimed by this session
             let my_symbols: Vec<&SymbolClaim> = claims
                 .iter()
                 .filter(|c| c.session_id == session_id)
                 .collect();
 
             for my_claim in &my_symbols {
-                // Check if any OTHER session also claims this symbol
                 for other_claim in claims {
                     if other_claim.session_id != session_id
                         && other_claim.qualified_name == my_claim.qualified_name
@@ -271,7 +316,6 @@ impl SymbolClaimTracker {
                                 first_touched_at: other_claim.first_touched_at,
                             },
                         ));
-                        // Only report the first conflicting session per symbol
                         break;
                     }
                 }
@@ -280,10 +324,7 @@ impl SymbolClaimTracker {
         results
     }
 
-    /// Remove all claims belonging to a session across ALL repos (e.g. on
-    /// disconnect or GC). Returns the released locks so callers can emit
-    /// `symbol.lock.released` events to unblock waiting agents.
-    pub fn clear_session(&self, session_id: Uuid) -> Vec<ReleasedLock> {
+    async fn clear_session(&self, session_id: Uuid) -> Vec<ReleasedLock> {
         let mut released = Vec::new();
         let mut empty_keys = Vec::new();
         for mut entry in self.claims.iter_mut() {
@@ -312,12 +353,6 @@ impl SymbolClaimTracker {
     }
 }
 
-impl Default for SymbolClaimTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,132 +363,141 @@ mod tests {
             agent_name: agent.to_string(),
             qualified_name: name.to_string(),
             kind,
-            first_touched_at: Instant::now(),
+            first_touched_at: Utc::now(),
         }
     }
 
-    #[test]
-    fn no_conflict_different_symbols_same_file() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn no_conflict_different_symbols_same_file() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
 
-        let conflicts = tracker.check_conflicts(
-            repo,
-            "src/lib.rs",
-            session_b,
-            &["fn_b".to_string()],
-        );
+        let conflicts = tracker
+            .check_conflicts(repo, "src/lib.rs", session_b, &["fn_b".to_string()])
+            .await;
         assert!(conflicts.is_empty(), "different symbols should not conflict");
     }
 
-    #[test]
-    fn conflict_same_symbol() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn conflict_same_symbol() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
 
-        let conflicts = tracker.check_conflicts(
-            repo,
-            "src/lib.rs",
-            session_b,
-            &["fn_a".to_string()],
-        );
+        let conflicts = tracker
+            .check_conflicts(repo, "src/lib.rs", session_b, &["fn_a".to_string()])
+            .await;
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].qualified_name, "fn_a");
         assert_eq!(conflicts[0].conflicting_session, session_a);
         assert_eq!(conflicts[0].conflicting_agent, "agent-1");
     }
 
-    #[test]
-    fn claims_cleared_on_session_destroy() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn claims_cleared_on_session_destroy() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
 
-        tracker.clear_session(session_a);
+        tracker.clear_session(session_a).await;
 
-        let conflicts = tracker.check_conflicts(
-            repo,
-            "src/lib.rs",
-            session_b,
-            &["fn_a".to_string()],
+        let conflicts = tracker
+            .check_conflicts(repo, "src/lib.rs", session_b, &["fn_a".to_string()])
+            .await;
+        assert!(
+            conflicts.is_empty(),
+            "cleared session should not cause conflicts"
         );
-        assert!(conflicts.is_empty(), "cleared session should not cause conflicts");
     }
 
-    #[test]
-    fn same_session_no_self_conflict() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn same_session_no_self_conflict() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
 
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
-        // Re-write same symbol from same session
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
 
-        let conflicts = tracker.check_conflicts(
-            repo,
-            "src/lib.rs",
-            session_a,
-            &["fn_a".to_string()],
+        let conflicts = tracker
+            .check_conflicts(repo, "src/lib.rs", session_a, &["fn_a".to_string()])
+            .await;
+        assert!(
+            conflicts.is_empty(),
+            "same session should not conflict with itself"
         );
-        assert!(conflicts.is_empty(), "same session should not conflict with itself");
     }
 
-    #[test]
-    fn multiple_conflicts() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn multiple_conflicts() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        );
-        tracker.record_claim(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_b", SymbolKind::Function),
-        );
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
+        tracker
+            .record_claim(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_b", SymbolKind::Function),
+            )
+            .await;
 
-        let conflicts = tracker.check_conflicts(
-            repo,
-            "src/lib.rs",
-            session_b,
-            &["fn_a".to_string(), "fn_b".to_string()],
-        );
+        let conflicts = tracker
+            .check_conflicts(
+                repo,
+                "src/lib.rs",
+                session_b,
+                &["fn_a".to_string(), "fn_b".to_string()],
+            )
+            .await;
         assert_eq!(conflicts.len(), 2);
 
         let names: Vec<&str> = conflicts.iter().map(|c| c.qualified_name.as_str()).collect();
@@ -461,61 +505,70 @@ mod tests {
         assert!(names.contains(&"fn_b"));
     }
 
-    // ── acquire_lock tests ──
-
-    #[test]
-    fn acquire_lock_unclaimed_succeeds() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn acquire_lock_unclaimed_succeeds() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session = Uuid::new_v4();
 
-        let result = tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        let result = tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn acquire_lock_same_session_succeeds() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn acquire_lock_same_session_succeeds() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        // Same session re-acquiring same symbol should succeed
-        let result = tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
-        );
+        let result = tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn acquire_lock_cross_session_blocked() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn acquire_lock_cross_session_blocked() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        let result = tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
-        );
+        let result = tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
+            )
+            .await;
         assert!(result.is_err());
         let locked = result.unwrap_err();
         assert_eq!(locked.qualified_name, "fn_a");
@@ -523,94 +576,109 @@ mod tests {
         assert_eq!(locked.locked_by_agent, "agent-1");
     }
 
-    #[test]
-    fn acquire_lock_different_symbols_same_file() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn acquire_lock_different_symbols_same_file() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        // Different symbol in same file — should succeed
-        let result = tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_b, "agent-2", "fn_b", SymbolKind::Function),
-        );
+        let result = tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_b, "agent-2", "fn_b", SymbolKind::Function),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
-    // ── release_lock tests ──
-
-    #[test]
-    fn release_lock_single_symbol() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn release_lock_single_symbol() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        // Release the lock
-        tracker.release_lock(repo, "src/lib.rs", session_a, "fn_a");
+        tracker
+            .release_lock(repo, "src/lib.rs", session_a, "fn_a")
+            .await;
 
-        // Now another session should be able to acquire it
-        let result = tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
-        );
+        let result = tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn release_lock_cleans_empty_entries() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn release_lock_cleans_empty_entries() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        tracker.release_lock(repo, "src/lib.rs", session, "fn_a");
+        tracker
+            .release_lock(repo, "src/lib.rs", session, "fn_a")
+            .await;
 
-        // The key should be removed from the map (no empty vecs lingering)
         let key = (repo, "src/lib.rs".to_string());
         assert!(tracker.claims.get(&key).is_none());
     }
 
-    // ── release_locks tests ──
-
-    #[test]
-    fn release_locks_returns_released_entries() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn release_locks_returns_released_entries() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
-        tracker.acquire_lock(
-            repo,
-            "src/api.rs",
-            make_claim(session, "agent-1", "handler", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/api.rs",
+                make_claim(session, "agent-1", "handler", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        let released = tracker.release_locks(repo, session);
+        let released = tracker.release_locks(repo, session).await;
         assert_eq!(released.len(), 2);
 
         let names: Vec<&str> = released.iter().map(|r| r.qualified_name.as_str()).collect();
@@ -618,34 +686,40 @@ mod tests {
         assert!(names.contains(&"handler"));
     }
 
-    #[test]
-    fn release_locks_unblocks_other_session() {
-        let tracker = SymbolClaimTracker::new();
+    #[tokio::test]
+    async fn release_locks_unblocks_other_session() {
+        let tracker = LocalClaimTracker::new();
         let repo = Uuid::new_v4();
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
-        ).unwrap();
+        tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_a, "agent-1", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .unwrap();
 
-        // session_b is blocked
-        assert!(tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
-        ).is_err());
+        assert!(tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .is_err());
 
-        // Release session_a
-        tracker.release_locks(repo, session_a);
+        tracker.release_locks(repo, session_a).await;
 
-        // session_b can now acquire
-        assert!(tracker.acquire_lock(
-            repo,
-            "src/lib.rs",
-            make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
-        ).is_ok());
+        assert!(tracker
+            .acquire_lock(
+                repo,
+                "src/lib.rs",
+                make_claim(session_b, "agent-2", "fn_a", SymbolKind::Function),
+            )
+            .await
+            .is_ok());
     }
 }
