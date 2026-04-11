@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use dk_core::{Error, Result, Symbol};
+use dk_core::{sanitize_for_proto, Error, Result, Symbol};
 
 use crate::parser::ParserRegistry;
 
@@ -244,10 +244,10 @@ pub fn build_conflict_detail(
     )?;
 
     Ok(SymbolConflictDetail {
-        file_path: file_path.to_string(),
-        qualified_name: qualified_name.to_string(),
-        kind,
-        conflicting_agent: conflicting_agent.to_string(),
+        file_path: sanitize_for_proto(file_path),
+        qualified_name: sanitize_for_proto(qualified_name),
+        kind: sanitize_for_proto(&kind),
+        conflicting_agent: sanitize_for_proto(conflicting_agent),
         their_change,
         your_change,
         base_version,
