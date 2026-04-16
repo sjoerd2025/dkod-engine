@@ -150,6 +150,15 @@ struct MergeParams {
 struct ApproveParams {
     /// Session ID from dk_connect (required when multiple sessions are active)
     session_id: Option<String>,
+    /// Bypass the deep-review gate. Requires `override_reason` ≥20 chars and
+    /// stamps an audit snapshot on the approve record. No-op when
+    /// DKOD_CODE_REVIEW is unset.
+    #[serde(default)]
+    force: Option<bool>,
+    /// Human-readable reason for bypassing the review gate. Required and
+    /// ≥20 characters when `force: true` and the gate is enabled.
+    #[serde(default)]
+    override_reason: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -255,6 +264,11 @@ pub struct DkodMcp {
     /// Per-session notification for blocking dk_watch. Signaled when new events
     /// are buffered so a waiting dk_watch call can wake up immediately.
     watch_notify: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Per-submit background review task handles.
+    /// Populated each time `dk_submit` spawns a deep-review task when the
+    /// code review gate is enabled. Cleared on `Drop` so closing the MCP
+    /// instance aborts in-flight provider HTTP calls.
+    review_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Cancel all per-session NATS and Watch tasks when the MCP instance drops
@@ -293,6 +307,13 @@ impl Drop for DkodMcp {
             }
             notifiers.clear();
         }
+        // Abort all pending review background tasks so closing the MCP
+        // doesn't leak outstanding provider HTTP calls.
+        if let Ok(mut tasks) = self.review_tasks.try_lock() {
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -317,6 +338,7 @@ impl DkodMcp {
             my_modified_symbols: Arc::new(Mutex::new(HashMap::new())),
             watch_overflow: Arc::new(Mutex::new(HashMap::new())),
             watch_notify: Arc::new(Mutex::new(HashMap::new())),
+            review_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -350,6 +372,7 @@ impl DkodMcp {
             my_modified_symbols: Arc::new(Mutex::new(HashMap::new())),
             watch_overflow: Arc::new(Mutex::new(HashMap::new())),
             watch_notify: Arc::new(Mutex::new(HashMap::new())),
+            review_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -400,6 +423,7 @@ impl DkodMcp {
             my_modified_symbols: Arc::new(Mutex::new(HashMap::new())),
             watch_overflow: Arc::new(Mutex::new(HashMap::new())),
             watch_notify: Arc::new(Mutex::new(HashMap::new())),
+            review_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -422,6 +446,7 @@ impl DkodMcp {
             my_modified_symbols: Arc::new(Mutex::new(HashMap::new())),
             watch_overflow: Arc::new(Mutex::new(HashMap::new())),
             watch_notify: Arc::new(Mutex::new(HashMap::new())),
+            review_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1697,6 +1722,67 @@ impl DkodMcp {
             }
         }
 
+        // Background deep review gate: spawn an async task to call the
+        // configured review provider (Anthropic/OpenRouter), then record the
+        // result via RecordReview so dk_approve can gate on its score.
+        // Only runs on a successful submit (Accepted). Fire-and-forget — any
+        // failure (no provider, gRPC dial failure, provider timeout) is
+        // swallowed, and dk_approve will see "no deep review recorded yet".
+        //
+        // TODO: diff + file context are passed empty for now; enriching them
+        // would require either a new GetChangesetDiff RPC or a FileList+
+        // FileRead loop. Deferred to a follow-up PR — the gate mechanism is
+        // the primary value of this change.
+        if response.status == crate::SubmitStatus::Accepted as i32 {
+            let cfg = crate::review_gate::GateConfig::from_env();
+            if cfg.enabled && !cfg.misconfigured() {
+                let (grpc_addr, auth_token) = {
+                    let conn = self.connection.read().await;
+                    (conn.server_addr.clone(), conn.auth_token.clone())
+                };
+                // Background review uses `conn.auth_token`, which is sourced
+                // from env var or dotenv — device-flow tokens cached to disk
+                // are not read back into `conn` (see SessionState::resolve).
+                // Without a token, `connect_grpc` returns `None` and the
+                // background task exits silently; `dk_approve` would then
+                // loop on `deep_review_pending`. Surface this explicitly so
+                // the user is not misled by a "review started" message.
+                if auth_token.is_none() {
+                    text.push_str(
+                        "\nDeep code review gate enabled but no DKOD_AUTH_TOKEN is                          available to the background task (device-flow tokens are not                          yet re-exposed to `dk_submit`). The background review will                          not run — set DKOD_AUTH_TOKEN in the env or dotenv, or use                          `dk_approve(force: true, override_reason: ...)` to bypass.\n"
+                    );
+                } else {
+                    let session_id_clone = session_id.clone();
+                    let changeset_id = response.changeset_id.clone();
+                    let cfg_clone = cfg.clone();
+                    let handle = tokio::spawn(async move {
+                        crate::review_gate::run_background_review(
+                            grpc_addr,
+                            auth_token,
+                            session_id_clone,
+                            changeset_id,
+                            String::new(),
+                            Vec::new(),
+                            cfg_clone,
+                        )
+                        .await;
+                    });
+                    {
+                        let mut tasks = self.review_tasks.lock().await;
+                        // Prune completed handles before adding a new one to bound
+                        // Vec growth for long-lived sessions.
+                        tasks.retain(|h| !h.is_finished());
+                        tasks.push(handle);
+                    }
+                    text.push_str(&format!(
+                        "\nDeep code review started in background (provider: {}, min_score: {}). Retry dk_approve to check status.\n",
+                        cfg.provider_name.as_deref().unwrap_or("?"),
+                        cfg.min_score
+                    ));
+                }
+            }
+        }
+
         let prefix = self
             .drain_notifications(&session_id)
             .await
@@ -2295,7 +2381,7 @@ impl DkodMcp {
 
     /// Approve a changeset via gRPC.
     #[tool(
-        description = "Approve a submitted changeset for the current session. Call after dk_submit and before dk_merge."
+        description = "Approve a submitted changeset for the current session. Call after dk_submit and before dk_merge. Pass `force: true` with an `override_reason` (≥20 chars) to bypass the deep-review gate when enabled."
     )]
     async fn dk_approve(
         &self,
@@ -2303,12 +2389,143 @@ impl DkodMcp {
     ) -> Result<CallToolResult, McpError> {
         let ApproveParams {
             session_id: param_session_id,
+            force,
+            override_reason,
         } = params;
+        let force = force.unwrap_or(false);
 
         let session = self.resolve_session(param_session_id.as_deref()).await?;
         let session_id = session.session_id.clone();
+        let changeset_id = session.changeset_id.clone();
 
         let mut client = self.get_client().await?;
+
+        let cfg = crate::review_gate::GateConfig::from_env();
+
+        // Force path: when `force: true` AND the gate is enabled, validate the
+        // override_reason, snapshot the current review state for the audit
+        // trail, and forward a force-approve request that bypasses the score
+        // check on the engine side. The success text carries a `⚠ force-approved`
+        // marker so downstream agents can see the bypass happened.
+        if force && cfg.enabled {
+            use crate::review_gate::OverrideReasonValidation as V;
+            let reason = match crate::review_gate::validate_override_reason(
+                override_reason.as_deref(),
+            ) {
+                V::Ok(r) => r,
+                V::Empty => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "force requires override_reason (non-empty)".to_string(),
+                    )]));
+                }
+                V::TooShort(n) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "override_reason must be at least 20 characters (describe why review is being bypassed) — got {n}"
+                    ))]));
+                }
+            };
+
+            // Snapshot the current deep-review state for the audit record.
+            // Skip the Review RPC if the gate is misconfigured — we still
+            // force-approve, but the snapshot will reflect "no review seen".
+            let deep_review_for_snapshot = if cfg.misconfigured() {
+                None
+            } else {
+                let review_req = crate::ReviewRequest {
+                    session_id: session_id.clone(),
+                    changeset_id: changeset_id.clone(),
+                };
+                let review_resp = client.review(review_req).await.map_err(|e| {
+                    McpError::internal_error(format!("REVIEW RPC failed: {e}"), None)
+                })?;
+                review_resp
+                    .into_inner()
+                    .reviews
+                    .into_iter()
+                    .find(|r| r.tier == "deep")
+            };
+            let snap = crate::review_gate::build_review_snapshot(
+                deep_review_for_snapshot.as_ref(),
+                &cfg,
+            );
+
+            let request = crate::ApproveRequest {
+                session_id: session_id.clone(),
+                override_reason: Some(reason.clone()),
+                review_snapshot: Some(snap),
+            };
+            let response = client
+                .approve(request)
+                .await
+                .map_err(|e| McpError::internal_error(format!("APPROVE RPC failed: {e}"), None))?
+                .into_inner();
+            let text = format!(
+                "Changeset approved!\nchangeset_id: {}\nstate: {}\n\u{26a0} force-approved: {}\n",
+                response.changeset_id, response.new_state, reason
+            );
+            let prefix = self
+                .drain_notifications(&session_id)
+                .await
+                .unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "{prefix}{text}"
+            ))]));
+        }
+
+        // `force: true` with the gate disabled is a no-op: we log the intent
+        // once to stderr and fall through to the normal approve path, which
+        // sends `override_reason: None, review_snapshot: None` to the engine
+        // and produces the standard success text (no `force-approved` marker).
+        if force && !cfg.enabled {
+            tracing::info!(
+                "force requested but gate is disabled — proceeding as normal approve"
+            );
+        }
+
+        // Deep-review gate (opt-in via DKOD_CODE_REVIEW=1). When enabled, fetch
+        // the recorded reviews for this changeset and consult the pure
+        // `evaluate_gate` helper. A `Reject` short-circuits with a structured
+        // JSON body that tells the caller how to proceed (retry, fix, or
+        // override via `force`). `PassWithPrefix` contains a human-readable
+        // one-liner that gets prepended to the approval success text.
+        let mut gate_prefix = String::new();
+        if cfg.enabled {
+            // `misconfigured` is decided inside `evaluate_gate`, but we skip
+            // the Review RPC when we already know the gate will reject — no
+            // point paying for a network round trip.
+            let deep_review_owned = if cfg.misconfigured() {
+                None
+            } else {
+                let review_req = crate::ReviewRequest {
+                    session_id: session_id.clone(),
+                    changeset_id: changeset_id.clone(),
+                };
+                let review_resp = client.review(review_req).await.map_err(|e| {
+                    McpError::internal_error(format!("REVIEW RPC failed: {e}"), None)
+                })?;
+                review_resp
+                    .into_inner()
+                    .reviews
+                    .into_iter()
+                    .find(|r| r.tier == "deep")
+            };
+
+            match crate::review_gate::evaluate_gate(&cfg, force, deep_review_owned.as_ref()) {
+                crate::review_gate::GateOutcome::Pass => { /* fall through to approve */ }
+                crate::review_gate::GateOutcome::PassWithPrefix(p) => {
+                    gate_prefix = p;
+                }
+                crate::review_gate::GateOutcome::Reject(body) => {
+                    let prefix = self
+                        .drain_notifications(&session_id)
+                        .await
+                        .unwrap_or_default();
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "{prefix}{body}"
+                    ))]));
+                }
+            }
+        }
 
         let request = crate::ApproveRequest {
             session_id: session_id.clone(),
@@ -2323,7 +2540,7 @@ impl DkodMcp {
             .into_inner();
 
         let text = format!(
-            "Changeset approved!\nchangeset_id: {}\nstate: {}\n\nThe changeset is now approved and ready for dk_merge.\n",
+            "{gate_prefix}Changeset approved!\nchangeset_id: {}\nstate: {}\n\nThe changeset is now approved and ready for dk_merge.\n",
             response.changeset_id, response.new_state
         );
 

@@ -947,8 +947,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "chrono",
  "dirs",
+ "dk-runner",
  "open",
  "prost",
  "prost-types",
