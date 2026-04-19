@@ -89,6 +89,33 @@ impl ProtocolServer {
         self.auth_config.validate(token)
     }
 
+    /// Check whether the bearer token in `metadata` carries admin scope.
+    ///
+    /// Extracts the `authorization: Bearer <token>` header, performs a full
+    /// signature + expiry validation using the server's configured secret, and
+    /// returns `true` when the `scope` claim equals `"admin"` or contains the
+    /// word `"admin"`.
+    ///
+    /// Returns `false` (not an error) if there is no auth header, the token
+    /// is not a JWT, or signature validation fails — callers can then fall
+    /// through to the owner-check.
+    pub(crate) fn has_admin_scope(&self, metadata: &tonic::metadata::MetadataMap) -> bool {
+        let Some(val) = metadata.get("authorization") else {
+            return false;
+        };
+        let Ok(header) = val.to_str() else {
+            return false;
+        };
+        let token = header.strip_prefix("Bearer ").unwrap_or(header);
+        // Perform full signature validation via the configured AuthConfig; only
+        // tokens that pass cryptographic verification can claim admin scope.
+        self.auth_config
+            .validate_claims(token)
+            .as_ref()
+            .map(crate::auth::claims_have_admin_scope)
+            .unwrap_or(false)
+    }
+
     /// Look up a session by its string-encoded UUID.  Returns an error if the
     /// ID is malformed or the session has expired / does not exist.
     pub(crate) fn validate_session(&self, session_id_str: &str) -> Result<AgentSession, Status> {
@@ -247,6 +274,13 @@ impl crate::agent_service_server::AgentService for ProtocolServer {
         Err(Status::unimplemented(
             "close is a platform-level operation; use the managed server",
         ))
+    }
+
+    async fn abandon(
+        &self,
+        request: Request<crate::AbandonRequest>,
+    ) -> Result<Response<crate::AbandonResponse>, Status> {
+        crate::abandon::handle_abandon(self, request).await
     }
 
     async fn review(
