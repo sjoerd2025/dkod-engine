@@ -9,91 +9,143 @@
 //! Connection configuration is read from the same env vars as
 //! [`dk_analytics::AnalyticsConfig::from_env`] so the CLI and engine
 //! stay in lockstep.
+//!
+//! Named summary queries live on disk under
+//! `crates/dk-analytics/src/queries/*.sql` and are bound with ClickHouse
+//! native `{name:Type}` parameters (mirroring pytorch/test-infra's
+//! `torchci/clickhouse_queries/*` pattern). No user-supplied value is
+//! interpolated into SQL — `--since` is parsed into a `DateTime<Utc>`
+//! client-side and passed through `Query::param`.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
 use colored::Colorize;
 
 #[derive(Subcommand)]
 pub enum AnalyticsAction {
     /// Apply the ClickHouse DDL from
-    /// [`dk_analytics::schema::DDL_STATEMENTS`] to the configured
-    /// warehouse. Idempotent — runs `CREATE TABLE IF NOT EXISTS` for
-    /// every table.
-    Migrate,
+    /// [`dk_analytics::schema::SCHEMA_SQL`] to the configured warehouse.
+    /// Idempotent — runs `CREATE TABLE IF NOT EXISTS` for every table.
+    Migrate {
+        /// Also apply the optional refreshable materialized views from
+        /// [`dk_analytics::schema::MATERIALIZED_VIEWS_SQL`]. Requires
+        /// ClickHouse 24.3+ for the `REFRESH EVERY` syntax.
+        #[arg(long)]
+        with_materialized_views: bool,
+    },
 
-    /// Run an arbitrary SQL query and print the results as a pipe-
-    /// delimited table. Intended for debugging; not for automation.
+    /// Run an arbitrary SQL query and print the row count. Intended for
+    /// smoke-testing connectivity, not for ad-hoc data exploration; use
+    /// `clickhouse-client` for that.
     Query {
         /// SQL statement. Quote it on the shell.
         sql: String,
     },
 
-    /// Print a short pre-built summary for a repo over a time window:
+    /// Print a short pre-built summary over a time window:
     /// - Number of changesets merged
     /// - Average verification duration
     /// - Review verdicts
     Summary {
-        /// Repository name (not UUID — looked up against the repo
-        /// table on the warehouse side).
+        /// Repository name (reserved — the filter is advisory until we
+        /// expose a `repo_id` lookup on the CLI).
         #[arg(long)]
         repo: String,
-        /// Lower bound for `created_at` / `transition_at`.
+        /// Lower bound for `created_at` / `transition_at`. Accepts:
         ///
-        /// Date-like values (e.g. `2024-01-01` or `2024-01-01T12:00:00`)
-        /// are automatically quoted. ClickHouse expressions matching
-        /// `now() [± INTERVAL N UNIT]` are passed through verbatim.
-        /// Any other shape is rejected to avoid SQL injection.
-        #[arg(long, default_value = "now() - INTERVAL 7 DAY")]
+        ///   * a date/datetime literal (e.g. `2024-01-01T12:00:00`)
+        ///   * a relative spec `<N><unit>` where unit is `m|h|d|w`
+        ///   * the string `now()`
+        ///   * a `now() ± INTERVAL N <unit>` expression
+        ///
+        /// All shapes are parsed client-side into a concrete UTC timestamp
+        /// and bound as a `DateTime64(3)` ClickHouse parameter — user input
+        /// is never concatenated into SQL.
+        #[arg(long, default_value = "7d")]
         since: String,
     },
 }
 
-/// Validate `--since` and render a ClickHouse SQL fragment for it.
+/// Parse a `--since` flag into a concrete `DateTime<Utc>`.
 ///
-/// Only two shapes are accepted:
-/// 1. A date or datetime literal (ISO-ish). We quote it.
-/// 2. A `now()`-rooted expression with optional `± INTERVAL N UNIT`.
-///
-/// Everything else is rejected so an attacker (or a confused operator)
-/// cannot inject arbitrary SQL via the flag.
-fn render_since(since: &str) -> Result<String> {
-    let s = since.trim();
-    let date_like = |c: char| c.is_ascii_digit() || c == '-' || c == ':' || c == 'T' || c == ' ';
-    if !s.is_empty() && s.chars().all(date_like) {
-        // Treat as a literal and quote it.
-        return Ok(format!("'{s}'"));
+/// This replaces the previous `render_since` which emitted a raw SQL
+/// fragment. Resolving client-side lets every query in `queries/*.sql`
+/// use ClickHouse native parameter binding (`{since:DateTime64(3)}`),
+/// which is the pattern pytorch/test-infra uses and is the ClickHouse
+/// team's recommended way to avoid SQL injection.
+fn parse_since(input: &str) -> Result<DateTime<Utc>> {
+    let s = input.trim();
+
+    // Shape 1: relative spec like `7d` or `30m`.
+    if let Some(dt) = parse_relative(s) {
+        return Ok(dt);
     }
 
-    // Allow a small whitelist of now()-rooted expressions.
+    // Shape 2: a bare `now()` or `now() ± INTERVAL N UNIT` (for back-compat
+    // with the previous CLI). We resolve this client-side too.
     let normalised: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     let lowered = normalised.to_ascii_lowercase();
-    let is_now_expr = lowered == "now()"
-        || lowered
-            .strip_prefix("now() - interval ")
-            .or_else(|| lowered.strip_prefix("now() + interval "))
-            .map(|rest| {
-                let mut it = rest.split_whitespace();
-                let n = it.next();
-                let unit = it.next();
-                let tail = it.next();
-                matches!(
-                    (n, unit, tail),
-                    (
-                        Some(n),
-                        Some("second" | "minute" | "hour" | "day" | "week" | "month" | "year"),
-                        None,
-                    ) if n.chars().all(|c| c.is_ascii_digit())
-                )
-            })
-            .unwrap_or(false);
-    if is_now_expr {
-        return Ok(normalised);
+    if lowered == "now()" {
+        return Ok(Utc::now());
+    }
+    for (prefix, sign) in [("now() - interval ", -1i64), ("now() + interval ", 1i64)] {
+        if let Some(rest) = lowered.strip_prefix(prefix) {
+            let mut it = rest.split_whitespace();
+            let n = it.next().and_then(|v| v.parse::<i64>().ok());
+            let unit = it.next();
+            if it.next().is_some() {
+                continue;
+            }
+            if let (Some(n), Some(unit)) = (n, unit) {
+                if let Some(delta) = interval_to_duration(n, unit) {
+                    return Ok(Utc::now() + Duration::seconds(sign * delta.num_seconds()));
+                }
+            }
+        }
+    }
+
+    // Shape 3: ISO-ish date or datetime literal.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+            return Ok(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+        }
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
     }
 
     anyhow::bail!(
-        "--since must be a date (e.g. 2024-01-01) or a `now() [± INTERVAL N {{second|minute|hour|day|week|month|year}}]` expression, got: {since}"
+        "--since could not be parsed. Try `7d`, `2024-01-01`, `2024-01-01T12:00:00Z`, \
+         `now()`, or `now() - INTERVAL 7 DAY`. Got: {input}"
     )
+}
+
+fn parse_relative(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    if num.is_empty() {
+        return None;
+    }
+    let n: i64 = num.parse().ok()?;
+    let delta = interval_to_duration(n, unit)?;
+    Some(Utc::now() - delta)
+}
+
+fn interval_to_duration(n: i64, unit: &str) -> Option<Duration> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "second" | "seconds" => Some(Duration::seconds(n)),
+        "m" | "minute" | "minutes" => Some(Duration::minutes(n)),
+        "h" | "hour" | "hours" => Some(Duration::hours(n)),
+        "d" | "day" | "days" => Some(Duration::days(n)),
+        "w" | "week" | "weeks" => Some(Duration::weeks(n)),
+        "month" | "months" => Some(Duration::days(30 * n)),
+        "year" | "years" => Some(Duration::days(365 * n)),
+        _ => None,
+    }
 }
 
 pub async fn run(action: AnalyticsAction) -> Result<()> {
@@ -103,11 +155,19 @@ pub async fn run(action: AnalyticsAction) -> Result<()> {
         dk_analytics::AnalyticsClient::new(&cfg).context("failed to build ClickHouse client")?;
 
     match action {
-        AnalyticsAction::Migrate => {
+        AnalyticsAction::Migrate {
+            with_materialized_views,
+        } => {
             println!("{}", "Applying ClickHouse DDL…".bold());
             dk_analytics::schema::migrate(&client)
                 .await
                 .context("ClickHouse migration failed")?;
+            if with_materialized_views {
+                println!("{}", "Applying refreshable materialized views…".bold());
+                dk_analytics::schema::migrate_materialized_views(&client)
+                    .await
+                    .context("ClickHouse materialized-view migration failed")?;
+            }
             println!("{}", "Analytics schema migrated".green());
         }
         AnalyticsAction::Query { sql } => {
@@ -141,52 +201,39 @@ pub async fn run(action: AnalyticsAction) -> Result<()> {
 ///
 /// Three separate queries rather than one big CTE — keeps each one
 /// trivially readable and lets us bail early with a good error message
-/// if any single one fails.
+/// if any single one fails. Each query lives in
+/// `crates/dk-analytics/src/queries/*.sql` and uses ClickHouse native
+/// parameter binding for `since`.
 async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str) -> Result<()> {
-    let since_sql = render_since(since)?;
+    let since_dt = parse_since(since)?;
     println!(
-        "{} over window `{}`",
+        "{} since {since_dt} (from `{since}`)",
         format!("Summary for repo {repo}").bold(),
-        since
     );
-
-    // All three queries are executed as raw `execute()` calls that
-    // project to scalar strings — `clickhouse`'s typed fetch API wants
-    // `#[derive(Row)]` types which would bloat this module with one
-    // shim struct per query. Scalar `String` fetch is good enough for
-    // an operator-facing summary.
     let _ = repo; // reserved for future per-repo filter once repo_id lookup exists.
-    let merged_sql = format!(
-        "SELECT toString(count()) FROM changeset_lifecycle \
-         WHERE state = 'merged' AND transition_at >= {since_sql}"
-    );
+
     let merged: String = client
         .inner()
-        .query(&merged_sql)
+        .query(dk_analytics::queries::SUMMARY_MERGED_COUNT)
+        .param("since", since_dt)
         .fetch_one::<String>()
         .await
         .unwrap_or_else(|_| "0".to_string());
     println!("  merged changesets: {merged}");
 
-    let avg_sql = format!(
-        "SELECT toString(round(avg(duration_ms))) FROM verification_runs \
-         WHERE created_at >= {since_sql}"
-    );
     let avg: String = client
         .inner()
-        .query(&avg_sql)
+        .query(dk_analytics::queries::SUMMARY_AVG_VERIFICATION_MS)
+        .param("since", since_dt)
         .fetch_one::<String>()
         .await
         .unwrap_or_else(|_| "0".to_string());
     println!("  avg verification step: {avg} ms");
 
-    let verdicts_sql = format!(
-        "SELECT verdict || ':' || toString(count()) FROM review_results \
-         WHERE created_at >= {since_sql} GROUP BY verdict"
-    );
     let verdicts: Vec<String> = client
         .inner()
-        .query(&verdicts_sql)
+        .query(dk_analytics::queries::SUMMARY_REVIEW_VERDICTS)
+        .param("since", since_dt)
         .fetch_all::<String>()
         .await
         .unwrap_or_default();
@@ -199,4 +246,44 @@ async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_since_handles_relative() {
+        let before = Utc::now();
+        let dt = parse_since("7d").unwrap();
+        let after = Utc::now();
+        assert!(dt <= before - Duration::days(7) + Duration::seconds(2));
+        assert!(dt >= after - Duration::days(7) - Duration::seconds(2));
+    }
+
+    #[test]
+    fn parse_since_handles_iso_date() {
+        let dt = parse_since("2024-01-15").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2024-01-15T00:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_since_handles_iso_datetime() {
+        let dt = parse_since("2024-01-15T12:30:00Z").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2024-01-15T12:30:00+00:00");
+    }
+
+    #[test]
+    fn parse_since_handles_now_expr() {
+        let dt = parse_since("now() - INTERVAL 7 DAY").unwrap();
+        let expected = Utc::now() - Duration::days(7);
+        assert!((dt - expected).num_seconds().abs() <= 2);
+    }
+
+    #[test]
+    fn parse_since_rejects_sql_injection() {
+        assert!(parse_since("'; DROP TABLE x; --").is_err());
+        assert!(parse_since("now() - INTERVAL 7 DAY; DROP TABLE x").is_err());
+        assert!(parse_since("UNION SELECT").is_err());
+    }
 }
