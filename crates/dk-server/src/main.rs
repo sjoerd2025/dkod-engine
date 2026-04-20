@@ -11,7 +11,10 @@ use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "dk-server", about = "dkod Reference Server — engine + Agent Protocol")]
+#[command(
+    name = "dk-server",
+    about = "dkod Reference Server — engine + Agent Protocol"
+)]
 struct Cli {
     /// PostgreSQL connection string
     #[arg(long, env = "DATABASE_URL")]
@@ -71,6 +74,25 @@ async fn main() -> Result<()> {
             token: cli.auth_token,
         },
     };
+
+    // Epic B: reconcile orphaned workspaces at boot. Mark any non-terminal
+    // session_workspaces rows without a live in-memory session as stranded,
+    // releasing their locks so sibling agents unblock immediately.
+    match engine.workspace_manager().startup_reconcile().await {
+        Ok(n) => tracing::info!(stranded = n, "startup_reconcile complete"),
+        Err(e) => {
+            tracing::error!(error = %e, "startup_reconcile failed — refusing to start");
+            std::process::exit(1);
+        }
+    }
+
+    // Spawn the periodic GC + stranded sweep (runs every GC_INTERVAL).
+    engine.spawn_gc_loop(
+        std::time::Duration::from_secs(60),     // tick
+        std::time::Duration::from_secs(3_600),  // idle_ttl (60 min)
+        std::time::Duration::from_secs(86_400), // max_ttl  (24 h)
+        std::time::Duration::from_secs(14_400), // stranded_ttl (4 h, spec §Policy #6)
+    );
 
     let protocol = ProtocolServer::new(engine, auth_config);
 

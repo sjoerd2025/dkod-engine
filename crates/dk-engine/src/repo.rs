@@ -3,20 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use dk_core::{
-    CallEdge, Error, RawCallEdge, RepoId, Result, Symbol, SymbolId,
-};
+use dk_core::{CallEdge, Error, RawCallEdge, RepoId, Result, Symbol, SymbolId};
 use sqlx::postgres::PgPool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::changeset::ChangesetStore;
 use crate::git::GitRepository;
-use crate::pipeline::PipelineStore;
-use crate::graph::{
-    CallGraphStore, DependencyStore, SearchIndex, SymbolStore, TypeInfoStore,
-};
+use crate::graph::{CallGraphStore, DependencyStore, SearchIndex, SymbolStore, TypeInfoStore};
 use crate::parser::ParserRegistry;
+use crate::pipeline::PipelineStore;
 use crate::workspace::cache::{NoOpCache, WorkspaceCache};
 use crate::workspace::session_manager::WorkspaceManager;
 
@@ -48,7 +44,7 @@ pub struct Engine {
     type_info_store: TypeInfoStore,
     changeset_store: ChangesetStore,
     pipeline_store: PipelineStore,
-    workspace_manager: WorkspaceManager,
+    workspace_manager: Arc<WorkspaceManager>,
     repo_locks: DashMap<RepoId, Arc<RwLock<()>>>,
 }
 
@@ -82,7 +78,7 @@ impl Engine {
         let type_info_store = TypeInfoStore::new(db.clone());
         let changeset_store = ChangesetStore::new(db.clone());
         let pipeline_store = PipelineStore::new(db.clone());
-        let workspace_manager = WorkspaceManager::with_cache(db.clone(), cache);
+        let workspace_manager = Arc::new(WorkspaceManager::with_cache(db.clone(), cache));
 
         Ok(Self {
             db,
@@ -120,6 +116,11 @@ impl Engine {
         &self.workspace_manager
     }
 
+    /// Returns a cloned `Arc` handle to the workspace manager.
+    pub fn workspace_manager_arc(&self) -> Arc<WorkspaceManager> {
+        Arc::clone(&self.workspace_manager)
+    }
+
     /// Returns a reference to the call graph store for direct DB queries.
     pub fn call_graph_store(&self) -> &CallGraphStore {
         &self.call_graph_store
@@ -148,6 +149,53 @@ impl Engine {
     /// Remove the repo lock entry for a deleted repo.
     pub fn remove_repo_lock(&self, repo_id: RepoId) {
         self.repo_locks.remove(&repo_id);
+    }
+
+    /// Spawn a background Tokio task that runs the periodic GC loop.
+    ///
+    /// Every `tick` the loop:
+    /// 1. Calls [`WorkspaceManager::gc_expired_sessions_async`] (activity-based GC).
+    /// 2. Calls [`WorkspaceManager::sweep_stranded`] (auto-abandon stranded
+    ///    workspaces that have exceeded `stranded_ttl`).
+    ///
+    /// The returned `JoinHandle` can be aborted on shutdown. This method is
+    /// idempotent — callers are responsible for not calling it twice.
+    pub fn spawn_gc_loop(
+        &self,
+        tick: std::time::Duration,
+        idle_ttl: std::time::Duration,
+        max_ttl: std::time::Duration,
+        stranded_ttl: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let mgr = Arc::clone(&self.workspace_manager);
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                // 1. Activity-based GC.
+                let evicted = mgr.gc_expired_sessions_async(idle_ttl, max_ttl).await;
+                if !evicted.is_empty() {
+                    tracing::info!(count = evicted.len(), "gc: evicted expired sessions");
+                }
+                // 2. Sweep stranded workspaces past TTL.
+                match mgr.sweep_stranded(stranded_ttl).await {
+                    Ok(n) if n > 0 => tracing::info!(count = n, "gc: abandoned stranded sessions"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("gc: sweep_stranded error: {e}"),
+                }
+                // 3. Update stranded-active gauge.
+                let active: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM session_workspaces \
+                     WHERE stranded_at IS NOT NULL AND abandoned_at IS NULL",
+                )
+                .fetch_one(&db)
+                .await
+                .unwrap_or(0);
+                crate::metrics::set_workspace_stranded_active(active);
+            }
+        })
     }
 
     // ── Repository lifecycle ──
@@ -184,12 +232,11 @@ impl Engine {
     /// between full names (`"owner/repo"`) and short names (`"repo"`).
     pub async fn get_repo(&self, name: &str) -> Result<(RepoId, GitRepository)> {
         // Exact match.
-        let row: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, path FROM repositories WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.db)
-        .await?;
+        let row: Option<(Uuid, String)> =
+            sqlx::query_as("SELECT id, path FROM repositories WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&self.db)
+                .await?;
 
         // Fallback: input "owner/repo" but DB stores "repo", or vice versa.
         // Guard: the second OR branch only fires when $1 contains '/' to
@@ -224,13 +271,11 @@ impl Engine {
     ///
     /// Returns the `RepoId` and an opened `GitRepository` handle.
     pub async fn get_repo_by_db_id(&self, repo_id: RepoId) -> Result<(RepoId, GitRepository)> {
-        let row: (String,) = sqlx::query_as(
-            "SELECT path FROM repositories WHERE id = $1",
-        )
-        .bind(repo_id)
-        .fetch_optional(&self.db)
-        .await?
-        .ok_or_else(|| Error::RepoNotFound(repo_id.to_string()))?;
+        let row: (String,) = sqlx::query_as("SELECT path FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| Error::RepoNotFound(repo_id.to_string()))?;
 
         let git_repo = GitRepository::open(Path::new(&row.0))?;
         Ok((repo_id, git_repo))
@@ -243,11 +288,7 @@ impl Engine {
     /// Walks the working directory (skipping `.git`), parses every file with a
     /// supported extension, and populates the symbol table, type info store,
     /// call graph, and full-text search index.
-    pub async fn index_repo(
-        &self,
-        repo_id: RepoId,
-        git_repo: &GitRepository,
-    ) -> Result<()> {
+    pub async fn index_repo(&self, repo_id: RepoId, git_repo: &GitRepository) -> Result<()> {
         let root = git_repo.path().to_path_buf();
         let files = collect_files(&root, &self.parser);
 
@@ -260,13 +301,9 @@ impl Engine {
         let mut search_index = self.search_index.write().await;
 
         for file_path in &files {
-            let relative = file_path
-                .strip_prefix(&root)
-                .unwrap_or(file_path);
+            let relative = file_path.strip_prefix(&root).unwrap_or(file_path);
 
-            let source = std::fs::read(file_path).map_err(|e| {
-                Error::Io(e)
-            })?;
+            let source = std::fs::read(file_path).map_err(Error::Io)?;
 
             let analysis = self.parser.parse_file(relative, &source)?;
 
@@ -332,17 +369,12 @@ impl Engine {
         let mut search_index = self.search_index.write().await;
 
         for file_path in changed_files {
-            let relative = file_path
-                .strip_prefix(&root)
-                .unwrap_or(file_path);
+            let relative = file_path.strip_prefix(&root).unwrap_or(file_path);
             let rel_str = relative.to_string_lossy().to_string();
 
             // Fetch existing symbols for this file so we can remove their
             // search index entries.
-            let old_symbols = self
-                .symbol_store
-                .find_by_file(repo_id, &rel_str)
-                .await?;
+            let old_symbols = self.symbol_store.find_by_file(repo_id, &rel_str).await?;
             for old_sym in &old_symbols {
                 search_index.remove_symbol(old_sym.id)?;
             }
@@ -351,9 +383,7 @@ impl Engine {
             self.call_graph_store
                 .delete_edges_for_file(repo_id, &rel_str)
                 .await?;
-            self.symbol_store
-                .delete_by_file(repo_id, &rel_str)
-                .await?;
+            self.symbol_store.delete_by_file(repo_id, &rel_str).await?;
 
             // Re-parse.
             let full_path = root.join(relative);

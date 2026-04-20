@@ -82,6 +82,9 @@ struct ConnectParams {
     intent: String,
     /// Agent name (optional, auto-assigned if empty)
     agent_name: Option<String>,
+    /// Optional: session ID to resume. Used for reconnecting after eviction — if the
+    /// stranded workspace still exists in the database, the overlay + locks are rehydrated.
+    resume_session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -200,6 +203,12 @@ struct CloseParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct AbandonParams {
+    /// Session ID of the stranded workspace to abandon
+    session_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct WatchParams {
     /// Session ID from dk_connect (required when multiple sessions are active)
     session_id: Option<String>,
@@ -217,6 +226,24 @@ struct ReviewParams {
     session_id: Option<String>,
     /// The changeset ID to get review results for. If omitted, uses the current session's changeset.
     changeset_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PreSubmitCheckParams {
+    /// Session ID from dk_connect (required when multiple sessions are active)
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DelegateParams {
+    /// Repository name, e.g. 'demo/hello-world'. Must match the parent session's codebase.
+    repo: String,
+    /// What the sub-agent should accomplish
+    intent: String,
+    /// Agent name for the sub-session (auto-generated from the parent if omitted)
+    agent_name: Option<String>,
+    /// Optional parent session ID. Defaults to the currently resolved session.
+    parent_session_id: Option<String>,
 }
 
 /// MCP server that bridges Claude Code to the dkod Agent Protocol via gRPC.
@@ -448,6 +475,37 @@ impl DkodMcp {
             watch_notify: Arc::new(Mutex::new(HashMap::new())),
             review_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Get a gRPC client, establishing a connection even when no sessions are present.
+    ///
+    /// Unlike `get_client()`, this bypasses the sessions-check gate and will always
+    /// attempt to connect (or reuse a cached client). Use only for tools like
+    /// `dk_abandon` that must work regardless of whether an active session exists.
+    async fn force_connect_client(&self) -> Result<AuthenticatedClient, McpError> {
+        let mut cached = self.grpc_client.lock().await;
+
+        // Fast path: client already exists.
+        if let Some(client) = cached.as_ref() {
+            return Ok(client.clone());
+        }
+
+        // No cached client — establish a fresh connection from stored connection state.
+        let (addr, env_token) = {
+            let conn = self.connection.read().await;
+            (conn.server_addr.clone(), conn.auth_token.clone())
+        };
+        let api_base = derive_api_base(&addr);
+        let token = crate::auth::resolve_token(&api_base, env_token.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(format!("auth connect failed: {e}"), None))?;
+
+        let new_client = crate::grpc::connect_with_auth(&addr, token)
+            .await
+            .map_err(|e| McpError::internal_error(format!("gRPC connect failed: {e}"), None))?;
+
+        *cached = Some(new_client.clone());
+        Ok(new_client)
     }
 
     /// Get a clone of the cached gRPC client, or return an error if not connected.
@@ -827,8 +885,7 @@ impl DkodMcp {
                                     if let Some(warning_text) =
                                         format_conflict_warning(&event.details)
                                     {
-                                        let mut warnings =
-                                            pending_warnings_for_watch.lock().await;
+                                        let mut warnings = pending_warnings_for_watch.lock().await;
                                         let w = warnings
                                             .entry(session_id_for_task.clone())
                                             .or_default();
@@ -982,6 +1039,7 @@ impl DkodMcp {
             repo,
             intent,
             agent_name,
+            resume_session_id,
         } = params;
 
         // Extract connection params, then drop the lock before the gRPC call.
@@ -1023,12 +1081,19 @@ impl DkodMcp {
             self.get_client().await?
         };
 
+        let workspace_config = resume_session_id
+            .clone()
+            .map(|rsid| crate::WorkspaceConfig {
+                resume_session_id: Some(rsid),
+                ..Default::default()
+            });
+
         let request = crate::ConnectRequest {
             agent_id: "claude-code".to_string(),
             auth_token: String::new(), // Auth is now in gRPC metadata, not the proto field.
             codebase: repo.clone(),
             intent: intent.clone(),
-            workspace_config: None,
+            workspace_config: workspace_config.clone(),
             agent_name: agent_name.clone().unwrap_or_default(),
         };
 
@@ -1038,7 +1103,10 @@ impl DkodMcp {
         // stale cache and retry with a fresh device flow — once.
         let response = match &result {
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
-                tracing::warn!("token rejected ({}), clearing cache and re-authenticating", status.message());
+                tracing::warn!(
+                    "token rejected ({}), clearing cache and re-authenticating",
+                    status.message()
+                );
                 crate::auth::clear_cached_token();
                 {
                     let mut conn = self.connection.write().await;
@@ -1048,9 +1116,9 @@ impl DkodMcp {
                 let fresh_token = crate::auth::resolve_token(&api_base, None)
                     .await
                     .map_err(|e| McpError::internal_error(format!("re-auth failed: {e}"), None))?;
-                let new_client = create_client(&addr, fresh_token)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("gRPC reconnect failed: {e}"), None))?;
+                let new_client = create_client(&addr, fresh_token).await.map_err(|e| {
+                    McpError::internal_error(format!("gRPC reconnect failed: {e}"), None)
+                })?;
                 {
                     let mut cached = self.grpc_client.lock().await;
                     *cached = Some(new_client.clone());
@@ -1061,17 +1129,25 @@ impl DkodMcp {
                     auth_token: String::new(),
                     codebase: repo.clone(),
                     intent: intent.clone(),
-                    workspace_config: None,
+                    workspace_config,
                     agent_name: agent_name.unwrap_or_default(),
                 };
                 client
                     .connect(retry_request)
                     .await
-                    .map_err(|e| McpError::internal_error(format!("CONNECT RPC failed after re-auth: {e}"), None))?
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("CONNECT RPC failed after re-auth: {e}"),
+                            None,
+                        )
+                    })?
                     .into_inner()
             }
             Err(e) => {
-                return Err(McpError::internal_error(format!("CONNECT RPC failed: {e}"), None));
+                return Err(McpError::internal_error(
+                    format!("CONNECT RPC failed: {e}"),
+                    None,
+                ));
             }
             Ok(_) => result.unwrap().into_inner(),
         };
@@ -1086,6 +1162,31 @@ impl DkodMcp {
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(response.session_id.clone(), session_data);
+            // If this was a resume, evict the stale entry for the old session_id
+            // so it no longer appears as an "active" session in the MCP map.
+            if let Some(ref old_sid) = resume_session_id {
+                if old_sid != &response.session_id {
+                    sessions.remove(old_sid);
+                }
+            }
+        }
+        // Tear down any background tasks still running for the resumed (old) session.
+        if let Some(ref old_sid) = resume_session_id {
+            if old_sid != &response.session_id {
+                if let Some(flag) = self
+                    .nats_cancellations
+                    .lock()
+                    .await
+                    .remove(old_sid.as_str())
+                {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(handle) = self.nats_tasks.lock().await.remove(old_sid.as_str()) {
+                    handle.abort();
+                }
+                self.pending_warnings.lock().await.remove(old_sid.as_str());
+                self.cleanup_watch_for_session(old_sid).await;
+            }
         }
 
         // Subscribe to NATS conflict events for this session (optional — skipped if
@@ -1479,11 +1580,22 @@ impl DkodMcp {
             .map_err(|e| McpError::internal_error(format!("FILE_WRITE RPC failed: {e}"), None))?
             .into_inner();
 
-        // Distinguish SYMBOL_LOCKED (write rejected, empty hash) from advisory warnings
+        // Distinguish the write-rejected paths. Both SYMBOL_LOCKED and
+        // STALE_OVERLAY come back as "empty hash + conflict_warnings"; they
+        // are disambiguated by the message prefix on the first warning —
+        // see `crates/dk-protocol/src/file_write.rs` (STALE_OVERLAY_PREFIX).
         let write_rejected = response.new_hash.is_empty() && !response.conflict_warnings.is_empty();
-        let silent_rejection = response.new_hash.is_empty() && response.conflict_warnings.is_empty();
+        let silent_rejection =
+            response.new_hash.is_empty() && response.conflict_warnings.is_empty();
+        let stale_overlay_rejection = write_rejected
+            && response
+                .conflict_warnings
+                .first()
+                .is_some_and(|cw| cw.message.starts_with("STALE_OVERLAY"));
 
-        let mut text = if write_rejected {
+        let mut text = if stale_overlay_rejection {
+            format!("STALE_OVERLAY — write rejected for {path}\n\n")
+        } else if write_rejected {
             format!("SYMBOL_LOCKED — write rejected for {path}\n\n")
         } else if silent_rejection {
             format!("WRITE REJECTED — server returned no hash and no conflict details for {path}\n")
@@ -1511,7 +1623,21 @@ impl DkodMcp {
         }
 
         if !response.conflict_warnings.is_empty() {
-            if write_rejected {
+            if stale_overlay_rejection {
+                // Raw engine message already carries the competing
+                // changeset id + path. Surface it verbatim plus the
+                // recovery steps.
+                for cw in &response.conflict_warnings {
+                    text.push_str(&cw.message);
+                    text.push('\n');
+                }
+                text.push_str(
+                    "\nYour write was NOT applied — your session's view predates a \
+                    competing submitted changeset on this file. To proceed:\n",
+                );
+                text.push_str("  1. dk_file_read(path)  — refresh your view\n");
+                text.push_str("  2. dk_file_write(path, adapted_content)  — retry\n");
+            } else if write_rejected {
                 text.push_str("Locked symbols:\n");
                 for cw in &response.conflict_warnings {
                     text.push_str(&format!(
@@ -1519,9 +1645,13 @@ impl DkodMcp {
                         cw.symbol_name, cw.conflicting_agent
                     ));
                 }
-                text.push_str("\nYour write was NOT applied. To proceed:\n");
-                text.push_str("  1. dk_watch(filter: \"symbol.lock.released\", wait: true)\n");
-                text.push_str("  2. dk_file_read(path)  — get the merged version\n");
+                text.push_str(
+                    "\nYour write was NOT applied. Locks now release on the holder's \
+                    next dk_submit, so the typical wait is seconds (not the old merge-bound \
+                    window of minutes). To proceed:\n",
+                );
+                text.push_str("  1. dk_watch(filter: \"symbol.lock.released\", wait: true, timeout_ms: 30000)\n");
+                text.push_str("  2. dk_file_read(path)  — refresh your view\n");
                 text.push_str("  3. dk_file_write(path, adapted_content)  — retry\n");
             } else {
                 text.push_str("\nCONFLICT WARNING:\n");
@@ -1722,6 +1852,27 @@ impl DkodMcp {
             }
         }
 
+        // Behavior-change cue: on Accepted submits, let agents know that
+        // symbol locks released on this call so other sessions watching
+        // for `symbol.lock.released` will unblock. Default-on in the engine
+        // since 0.3.0; this mirrors that default and suppresses the note
+        // only when the operator has explicitly opted out by setting
+        // DKOD_RELEASE_ON_SUBMIT=0 in the MCP's own env.
+        if response.status == crate::SubmitStatus::Accepted as i32
+            && std::env::var("DKOD_RELEASE_ON_SUBMIT")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !matches!(v.as_str(), "0" | "false" | "off" | "no")
+                })
+                .unwrap_or(true)
+        {
+            text.push_str(
+                "\nLocks released on submit. Sessions waiting on \
+                 symbol.lock.released for any symbol in this changeset will \
+                 now unblock.\n",
+            );
+        }
+
         // Background deep review gate: spawn an async task to call the
         // configured review provider (Anthropic/OpenRouter), then record the
         // result via RecordReview so dk_approve can gate on its score.
@@ -1834,12 +1985,20 @@ impl DkodMcp {
             is_pass: bool,
             is_skip: bool,
             required: bool,
+            status: String,
             output: String,
             findings: Vec<crate::Finding>,
             suggestions: Vec<crate::Suggestion>,
+            duration_ms: u64,
         }
 
         let mut collected_steps: Vec<CollectedStep> = Vec::new();
+        // Time since the previous terminal step result (or stream start) —
+        // the Verify proto has no server-side timing field, so we record the
+        // elapsed wall-clock time the client observed between deliveries as
+        // a best-effort duration.
+        let verify_started_at = std::time::Instant::now();
+        let mut last_terminal_at = verify_started_at;
 
         while let Some(step_result) = stream.next().await {
             match step_result {
@@ -1855,15 +2014,21 @@ impl DkodMcp {
                     if status_lower.starts_with("run") {
                         continue;
                     }
+                    let now = std::time::Instant::now();
+                    let duration_ms =
+                        now.saturating_duration_since(last_terminal_at).as_millis() as u64;
+                    last_terminal_at = now;
                     collected_steps.push(CollectedStep {
                         step_name: step.step_name,
                         is_fail,
                         is_pass,
                         is_skip,
                         required: step.required,
+                        status: step.status.clone(),
                         output: step.output,
                         findings: step.findings,
                         suggestions: step.suggestions,
+                        duration_ms,
                     });
                 }
                 Err(e) => {
@@ -1905,9 +2070,7 @@ impl DkodMcp {
         for lang in &lang_order {
             let step_indices = &lang_groups[lang];
             let step_count = step_indices.len();
-            let lang_has_failure = step_indices
-                .iter()
-                .any(|&i| collected_steps[i].is_fail);
+            let lang_has_failure = step_indices.iter().any(|&i| collected_steps[i].is_fail);
 
             if lang_has_failure {
                 langs_failed += 1;
@@ -1956,9 +2119,7 @@ impl DkodMcp {
                             let trimmed = line.trim();
                             if trimmed.starts_with("test result:") {
                                 final_result_line = Some(trimmed);
-                            } else if trimmed.starts_with("test ")
-                                && trimmed.ends_with("FAILED")
-                            {
+                            } else if trimmed.starts_with("test ") && trimmed.ends_with("FAILED") {
                                 failed_count += 1;
                             } else if trimmed.contains("panicked at") {
                                 // Extract the panic message for dedup
@@ -2060,9 +2221,7 @@ impl DkodMcp {
                             } else {
                                 String::new()
                             };
-                            text.push_str(&format!(
-                                "    {total_passed} passed{ignored_note}\n"
-                            ));
+                            text.push_str(&format!("    {total_passed} passed{ignored_note}\n"));
                         } else {
                             let line_count = output.lines().count();
                             text.push_str(&format!("    ({line_count} lines of output)\n"));
@@ -2128,6 +2287,35 @@ impl DkodMcp {
         } else {
             text.push_str("Overall: SOME FAILED\n");
         }
+
+        // Emit a compact JSON block with per-step name/status/duration so
+        // programmatic MCP clients can parse the structured data without
+        // re-reading the human-readable text. Kept as a fenced code block
+        // since rmcp 0.16's `Content::text` is the only stable variant.
+        let json_steps: Vec<serde_json::Value> = collected_steps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "step_name": s.step_name,
+                    "status": s.status,
+                    "required": s.required,
+                    "duration_ms": s.duration_ms,
+                    "findings": s.findings.len(),
+                    "suggestions": s.suggestions.len(),
+                })
+            })
+            .collect();
+        let steps_json = serde_json::json!({
+            "session_id": session_id,
+            "overall_passed": all_passed && !stream_error_occurred,
+            "total_duration_ms": verify_started_at.elapsed().as_millis() as u64,
+            "steps": json_steps,
+        });
+        text.push_str("\n```json\n");
+        text.push_str(
+            &serde_json::to_string_pretty(&steps_json).unwrap_or_else(|_| "{}".to_string()),
+        );
+        text.push_str("\n```\n");
 
         let prefix = self
             .drain_notifications(&session_id)
@@ -2444,10 +2632,8 @@ impl DkodMcp {
                     .into_iter()
                     .find(|r| r.tier == "deep")
             };
-            let snap = crate::review_gate::build_review_snapshot(
-                deep_review_for_snapshot.as_ref(),
-                &cfg,
-            );
+            let snap =
+                crate::review_gate::build_review_snapshot(deep_review_for_snapshot.as_ref(), &cfg);
 
             let request = crate::ApproveRequest {
                 session_id: session_id.clone(),
@@ -2477,9 +2663,7 @@ impl DkodMcp {
         // sends `override_reason: None, review_snapshot: None` to the engine
         // and produces the standard success text (no `force-approved` marker).
         if force && !cfg.enabled {
-            tracing::info!(
-                "force requested but gate is disabled — proceeding as normal approve"
-            );
+            tracing::info!("force requested but gate is disabled — proceeding as normal approve");
         }
 
         // Deep-review gate (opt-in via DKOD_CODE_REVIEW=1). When enabled, fetch
@@ -2858,9 +3042,7 @@ impl DkodMcp {
         let session_id = session.session_id.clone();
         let filter_str = filter.unwrap_or_else(|| "*".to_string());
         let blocking = wait.unwrap_or(false);
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(30_000).min(120_000),
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).min(120_000));
 
         // Start the watch stream if not already running.
         self.start_watch_stream(&session_id, &filter_str).await;
@@ -2905,9 +3087,9 @@ impl DkodMcp {
                             flags.remove(&session_id).unwrap_or(false)
                         };
                         if !events.is_empty() || overflowed {
-                            return self.format_watch_response(
-                                &session_id, &prefix, events, overflowed,
-                            ).await;
+                            return self
+                                .format_watch_response(&session_id, &prefix, events, overflowed)
+                                .await;
                         }
                         // Spurious wake — return empty
                         return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -2951,7 +3133,8 @@ impl DkodMcp {
             notifiers.insert(session_id.clone(), Arc::new(tokio::sync::Notify::new()));
         }
 
-        self.format_watch_response(&session_id, &prefix, events, overflowed).await
+        self.format_watch_response(&session_id, &prefix, events, overflowed)
+            .await
     }
 
     /// Format watch events into a CallToolResult (shared by blocking and non-blocking paths).
@@ -2986,7 +3169,9 @@ impl DkodMcp {
 
     // ── Tool 14: dk_review ──
 
-    #[tool(description = "Get code review results for a changeset. Returns review score (1-5), findings with severity/category/message/suggestion, and confidence levels. Call after dk_submit to see full review details, or at any time to query an older changeset's review.")]
+    #[tool(
+        description = "Get code review results for a changeset. Returns review score (1-5), findings with severity/category/message/suggestion, and confidence levels. Call after dk_submit to see full review details, or at any time to query an older changeset's review."
+    )]
     async fn dk_review(
         &self,
         Parameters(params): Parameters<ReviewParams>,
@@ -3063,6 +3248,233 @@ impl DkodMcp {
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+    // ── Tool 15: dk_pre_submit_check ──
+
+    /// Dry-run conflict detection before dk_submit.
+    #[tool(
+        description = "Dry-run conflict detection for the current session before dk_submit. Returns a preview of potential semantic conflicts with other agents, plus file/symbol counts."
+    )]
+    async fn dk_pre_submit_check(
+        &self,
+        Parameters(params): Parameters<PreSubmitCheckParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let PreSubmitCheckParams {
+            session_id: param_session_id,
+        } = params;
+
+        let session = self.resolve_session(param_session_id.as_deref()).await?;
+        let session_id = session.session_id.clone();
+
+        let mut client = self.get_client().await?;
+
+        let request = crate::PreSubmitCheckRequest {
+            session_id: session_id.clone(),
+        };
+
+        let response = client
+            .pre_submit_check(request)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("PRE_SUBMIT_CHECK RPC failed: {e}"), None)
+            })?
+            .into_inner();
+
+        let mut text = format!(
+            "Pre-submit check for session {session_id}:\n\
+             - files_modified: {}\n\
+             - symbols_changed: {}\n\
+             - has_conflicts: {}\n",
+            response.files_modified, response.symbols_changed, response.has_conflicts,
+        );
+
+        if response.has_conflicts {
+            text.push_str("\nPotential conflicts:\n");
+            for c in &response.potential_conflicts {
+                text.push_str(&format!(
+                    "- {}::{}\n  yours:  {}\n  theirs: {}\n",
+                    c.file_path, c.symbol_name, c.our_change, c.their_change,
+                ));
+            }
+            text.push_str(
+                "\nResolve with dk_resolve or adjust your workspace before calling dk_submit.\n",
+            );
+        } else {
+            text.push_str("\nNo semantic conflicts detected — safe to call dk_submit.\n");
+        }
+
+        let prefix = self
+            .drain_notifications(&session_id)
+            .await
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{prefix}{text}"
+        ))]))
+    }
+
+    // ── Tool 16: dk_delegate ──
+
+    /// Spawn a sub-agent session for divide-and-conquer workflows.
+    #[tool(
+        description = "Open a new agent session on the same codebase so a parent agent can orchestrate parallel sub-tasks. Returns the new session_id (use it as session_id for subsequent dk_* calls). The parent session stays open."
+    )]
+    async fn dk_delegate(
+        &self,
+        Parameters(params): Parameters<DelegateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let DelegateParams {
+            repo,
+            intent,
+            agent_name,
+            parent_session_id,
+        } = params;
+
+        // Resolve the parent session to seed the sub-session's agent_name when
+        // the caller did not provide one. This keeps sub-sessions discoverable
+        // in the UI by suffixing the parent name rather than inventing a
+        // completely unrelated handle.
+        let parent = self
+            .resolve_session(parent_session_id.as_deref())
+            .await
+            .ok();
+        let parent_id = parent
+            .as_ref()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_default();
+
+        let derived_agent_name = agent_name.unwrap_or_else(|| {
+            // Compact the parent session ID (UUID) to the first 8 chars so the
+            // sub-agent's name stays readable in the concurrency summary.
+            let short = parent_id.chars().take(8).collect::<String>();
+            if short.is_empty() {
+                "dk-sub".to_string()
+            } else {
+                format!("sub-of-{short}")
+            }
+        });
+
+        let mut client = self.get_client().await?;
+
+        let request = crate::ConnectRequest {
+            agent_id: "claude-code".to_string(),
+            auth_token: String::new(),
+            codebase: repo.clone(),
+            intent: intent.clone(),
+            workspace_config: None,
+            agent_name: derived_agent_name.clone(),
+        };
+
+        let response = client
+            .connect(request)
+            .await
+            .map_err(|e| McpError::internal_error(format!("CONNECT RPC failed: {e}"), None))?
+            .into_inner();
+
+        let new_session_id = response.session_id.clone();
+        let session_data = SessionData {
+            session_id: new_session_id.clone(),
+            workspace_id: response.workspace_id.clone(),
+            changeset_id: response.changeset_id.clone(),
+            repo_name: repo.clone(),
+        };
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(new_session_id.clone(), session_data);
+        }
+
+        let parent_label = if parent_id.is_empty() {
+            "<none>".to_string()
+        } else {
+            parent_id.clone()
+        };
+
+        let text = format!(
+            "Delegated sub-session created.\n\
+             parent_session_id: {parent_label}\n\
+             session_id: {new_session_id}\n\
+             agent_name: {derived_agent_name}\n\
+             repo: {repo}\n\
+             intent: {intent}\n\
+             changeset_id: {}\n\
+             workspace_id: {}\n\n\
+             Pass session_id={new_session_id} to subsequent dk_* tool calls to operate on this sub-session.\n",
+            response.changeset_id, response.workspace_id
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    // ── Tool 17: dk_abandon ──
+
+    /// Force-abandon a stranded workspace (owner-authorized).
+    #[tool(
+        description = "Force-abandon a stranded workspace (owner-authorized). Use when a session is stranded and you want to drop it instead of resuming. Releases overlay, marks changeset rejected, tombstones the workspace row."
+    )]
+    async fn dk_abandon(
+        &self,
+        Parameters(params): Parameters<AbandonParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let AbandonParams { session_id } = params;
+
+        // Use force_connect_client so abandon works even when sessions map is empty
+        // (e.g. fresh MCP start where the user wants to clean up a stranded session
+        // without first calling dk_connect).
+        let mut client = self.force_connect_client().await?;
+
+        let request = crate::AbandonRequest {
+            session_id: session_id.clone(),
+        };
+
+        let response = client
+            .abandon(request)
+            .await
+            .map_err(|e| McpError::internal_error(format!("ABANDON RPC failed: {e}"), None))?
+            .into_inner();
+
+        let text = if response.success {
+            format!(
+                "Abandoned session {}.\nchangeset_id: {}\nreason: {}",
+                session_id, response.changeset_id, response.abandoned_reason,
+            )
+        } else {
+            format!(
+                "Abandon failed for session {}.\nchangeset_id: {}\nreason: {}",
+                session_id, response.changeset_id, response.abandoned_reason,
+            )
+        };
+
+        if response.success {
+            // Clean up local MCP session state (session map, NATS task, Watch task).
+            {
+                let mut sessions = self.sessions.write().await;
+                sessions.remove(&session_id);
+                if sessions.is_empty() {
+                    let mut cached = self.grpc_client.lock().await;
+                    *cached = None;
+                }
+            }
+            {
+                let mut cancellations = self.nats_cancellations.lock().await;
+                if let Some(flag) = cancellations.remove(&session_id) {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            {
+                let mut tasks = self.nats_tasks.lock().await;
+                if let Some(handle) = tasks.remove(&session_id) {
+                    handle.abort();
+                }
+            }
+            {
+                let mut w = self.pending_warnings.lock().await;
+                w.remove(&session_id);
+            }
+            self.cleanup_watch_for_session(&session_id).await;
+
+            Ok(CallToolResult::success(vec![Content::text(text)]))
+        } else {
+            Ok(CallToolResult::error(vec![Content::text(text)]))
+        }
     }
 }
 

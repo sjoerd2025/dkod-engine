@@ -1,10 +1,34 @@
 use tonic::{Response, Status};
 use tracing::{info, warn};
 
-use dk_engine::conflict::{AcquireOutcome, SymbolClaim};
 use crate::server::ProtocolServer;
+use crate::stale_overlay::{is_stale, CompetingChangeset};
 use crate::validation::{validate_file_path, MAX_FILE_SIZE};
 use crate::{ConflictWarning, FileWriteRequest, FileWriteResponse, SymbolChange};
+use dk_engine::conflict::{AcquireOutcome, SymbolClaim};
+
+/// Message prefix MCP uses to distinguish STALE_OVERLAY from SYMBOL_LOCKED.
+/// Both flow through `ConflictWarning` with an empty `new_hash`, so the
+/// prefix is the contract. Do not change without updating the MCP parser.
+const STALE_OVERLAY_PREFIX: &str = "STALE_OVERLAY";
+
+/// Env flag for the release-locks-at-submit + STALE_OVERLAY behavior.
+///
+/// **Default: on.** Opt out with `DKOD_RELEASE_ON_SUBMIT=0` (also `false`,
+/// `FALSE`, `no`) if you need to revert to the old "release at merge"
+/// behavior. The flag is preserved as a rollback valve — flipping it off
+/// makes both the release-at-submit call site in `handle_submit` and the
+/// STALE_OVERLAY pre-write check in `handle_file_write` no-ops in a single
+/// place.
+///
+/// Shared with `submit.rs` so both call sites read the flag with identical
+/// semantics — preventing drift if one handler's parse logic is ever
+/// tweaked without the other.
+pub(crate) fn release_on_submit_enabled() -> bool {
+    std::env::var("DKOD_RELEASE_ON_SUBMIT")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no"))
+        .unwrap_or(true)
+}
 
 /// Handle a FileWrite RPC.
 ///
@@ -21,6 +45,7 @@ pub async fn handle_file_write(
     }
 
     let session = server.validate_session(&req.session_id)?;
+    crate::require_live_session::require_live_session(server, &req.session_id).await?;
 
     let sid = req
         .session_id
@@ -62,11 +87,89 @@ pub async fn handle_file_write(
     let repo_id_str = repo_id.to_string();
     let changeset_id = ws.changeset_id;
     let agent_name = ws.agent_name.clone();
+    // Snapshot last-read for the STALE_OVERLAY check before we drop ws.
+    let last_read_at = ws.last_read(&req.path);
 
     // Drop workspace guard — overlay write is deferred until after lock acquisition
     drop(ws);
 
     let op = if is_new { "add" } else { "modify" };
+
+    // ── STALE_OVERLAY pre-write check (DKOD_RELEASE_ON_SUBMIT only) ──
+    // Rationale: once locks release at `dk_submit` (instead of `dk_merge`),
+    // a waiter can re-acquire a symbol seconds after the holder submits.
+    // If the waiter skips the re-read step from the SYMBOL_LOCKED recovery
+    // contract, it would silently clobber the still-in-flight overlay.
+    // Best-effort backstop — AST merger at merge remains the final
+    // authority; a race that slips past this check degrades to today's
+    // merge-time reconciliation, not to data loss.
+    if release_on_submit_enabled() {
+        let competitors_raw = match engine
+            .changeset_store()
+            .list_path_competitors(repo_id, &req.path)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Storage error — fail open (don't block the write) so a
+                // transient DB hiccup never blocks user-visible writes.
+                // The spike shows up in the standard tracing output if
+                // this ever becomes chronic.
+                warn!(
+                    session_id = %sid,
+                    path = %req.path,
+                    error = %e,
+                    "STALE_OVERLAY check failed — skipping (fail-open)"
+                );
+                Vec::new()
+            }
+        };
+        let competitors: Vec<CompetingChangeset> = competitors_raw
+            .into_iter()
+            .map(|(cs_id, cs_sid, state, updated)| CompetingChangeset {
+                changeset_id: cs_id,
+                session_id: cs_sid,
+                state,
+                updated_at: updated,
+            })
+            .collect();
+
+        if let Some(stale) = is_stale(sid, last_read_at, &competitors) {
+            info!(
+                session_id = %sid,
+                path = %req.path,
+                competing_changeset = %stale.changeset_id,
+                competing_state = %stale.state,
+                "STALE_OVERLAY: write rejected (session view predates competing submit)"
+            );
+            crate::metrics::incr_stale_overlay_rejected();
+
+            let message = format!(
+                "{prefix}: your overlay for path={path} predates competing \
+                 changeset {cid} (state={state}). Call dk_file_read('{path}') \
+                 to refresh, then retry dk_file_write.",
+                prefix = STALE_OVERLAY_PREFIX,
+                path = req.path,
+                cid = stale.changeset_id,
+                state = stale.state,
+            );
+
+            return Ok(Response::new(FileWriteResponse {
+                new_hash: String::new(),
+                detected_changes: Vec::new(),
+                conflict_warnings: vec![ConflictWarning {
+                    file_path: req.path.clone(),
+                    symbol_name: String::new(),
+                    conflicting_agent: String::new(),
+                    conflicting_session_id: stale
+                        .session_id
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    message,
+                }],
+            }));
+        }
+    }
 
     // Detect symbol changes from req.content directly — no overlay needed yet.
     let (detected_changes, all_symbol_changes) =
@@ -78,25 +181,34 @@ pub async fn handle_file_write(
     // changeset store entry — completely clean rejection.
     let claimable: Vec<&crate::SymbolChangeDetail> = all_symbol_changes
         .iter()
-        .filter(|sc| sc.change_type == "added" || sc.change_type == "modified" || sc.change_type == "deleted")
+        .filter(|sc| {
+            sc.change_type == "added" || sc.change_type == "modified" || sc.change_type == "deleted"
+        })
         .collect();
 
     let mut acquired: Vec<String> = Vec::new();
     let mut locked_symbols: Vec<ConflictWarning> = Vec::new();
 
     for sc in &claimable {
-        let kind = sc.kind.parse::<dk_core::SymbolKind>().unwrap_or(dk_core::SymbolKind::Function);
-        match server.claim_tracker().acquire_lock(
-            repo_id,
-            &req.path,
-            SymbolClaim {
-                session_id: sid,
-                agent_name: agent_name.clone(),
-                qualified_name: sc.symbol_name.clone(),
-                kind,
-                first_touched_at: chrono::Utc::now(),
-            },
-        ).await {
+        let kind = sc
+            .kind
+            .parse::<dk_core::SymbolKind>()
+            .unwrap_or(dk_core::SymbolKind::Function);
+        match server
+            .claim_tracker()
+            .acquire_lock(
+                repo_id,
+                &req.path,
+                SymbolClaim {
+                    session_id: sid,
+                    agent_name: agent_name.clone(),
+                    qualified_name: sc.symbol_name.clone(),
+                    kind,
+                    first_touched_at: chrono::Utc::now(),
+                },
+            )
+            .await
+        {
             Ok(AcquireOutcome::Fresh) => acquired.push(sc.symbol_name.clone()),
             Ok(AcquireOutcome::ReAcquired) => {} // already held — exclude from rollback
             Err(sl) => {
@@ -125,7 +237,10 @@ pub async fn handle_file_write(
         // Roll back any locks acquired before the failure and emit events
         // so any agent that raced and observed the transient lock can wake up.
         for name in &acquired {
-            server.claim_tracker().release_lock(repo_id, &req.path, sid, name).await;
+            server
+                .claim_tracker()
+                .release_lock(repo_id, &req.path, sid, name)
+                .await;
             server.event_bus().publish(crate::WatchEvent {
                 event_type: crate::merge::EVENT_LOCK_RELEASED.to_string(),
                 changeset_id: String::new(),
@@ -164,7 +279,10 @@ pub async fn handle_file_write(
         Some(ws) => ws,
         None => {
             for name in &acquired {
-                server.claim_tracker().release_lock(repo_id, &req.path, sid, name).await;
+                server
+                    .claim_tracker()
+                    .release_lock(repo_id, &req.path, sid, name)
+                    .await;
                 server.event_bus().publish(crate::WatchEvent {
                     event_type: crate::merge::EVENT_LOCK_RELEASED.to_string(),
                     changeset_id: String::new(),
@@ -185,11 +303,18 @@ pub async fn handle_file_write(
         }
     };
 
-    let new_hash = match ws.overlay.write(&req.path, req.content.clone(), is_new).await {
+    let new_hash = match ws
+        .overlay
+        .write(&req.path, req.content.clone(), is_new)
+        .await
+    {
         Ok(hash) => hash,
         Err(e) => {
             for name in &acquired {
-                server.claim_tracker().release_lock(repo_id, &req.path, sid, name).await;
+                server
+                    .claim_tracker()
+                    .release_lock(repo_id, &req.path, sid, name)
+                    .await;
                 server.event_bus().publish(crate::WatchEvent {
                     event_type: crate::merge::EVENT_LOCK_RELEASED.to_string(),
                     changeset_id: String::new(),
@@ -221,7 +346,11 @@ pub async fn handle_file_write(
     let conflict_warnings: Vec<ConflictWarning> = Vec::new();
 
     // Emit a file.modified (or file.added) event
-    let event_type = if is_new { "file.added" } else { "file.modified" };
+    let event_type = if is_new {
+        "file.added"
+    } else {
+        "file.modified"
+    };
     server.event_bus().publish(crate::WatchEvent {
         event_type: event_type.to_string(),
         changeset_id: changeset_id.to_string(),
@@ -329,12 +458,15 @@ fn detect_symbol_changes_diffed(
     // Build a map of old symbol qualified_name → source text.
     // Use entry().or_insert() to keep the first occurrence when duplicate
     // qualified names exist (e.g., overloaded methods in Java/Kotlin/C#).
-    let mut old_symbol_text: std::collections::HashMap<&str, &[u8]> = std::collections::HashMap::new();
+    let mut old_symbol_text: std::collections::HashMap<&str, &[u8]> =
+        std::collections::HashMap::new();
     for sym in &old_symbols {
         let start = sym.span.start_byte as usize;
         let end = sym.span.end_byte as usize;
         if start <= end && end <= old_content.len() {
-            old_symbol_text.entry(sym.qualified_name.as_str()).or_insert(&old_content[start..end]);
+            old_symbol_text
+                .entry(sym.qualified_name.as_str())
+                .or_insert(&old_content[start..end]);
         }
     }
 
@@ -401,7 +533,10 @@ fn detect_symbol_changes_diffed(
         .collect();
     for old_name in &old_names {
         if !new_names.contains(old_name) {
-            if let Some(old_sym) = old_symbols.iter().find(|s| s.qualified_name.as_str() == *old_name) {
+            if let Some(old_sym) = old_symbols
+                .iter()
+                .find(|s| s.qualified_name.as_str() == *old_name)
+            {
                 all_details.push(crate::SymbolChangeDetail {
                     symbol_name: old_sym.qualified_name.clone(),
                     file_path: path.to_string(),

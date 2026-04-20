@@ -29,9 +29,7 @@ impl ProtocolServer {
     pub fn new(engine: Arc<Engine>, auth_config: AuthConfig) -> Self {
         Self {
             engine,
-            session_mgr: Arc::new(SessionManager::new(std::time::Duration::from_secs(
-                30 * 60,
-            ))),
+            session_mgr: Arc::new(SessionManager::new(std::time::Duration::from_secs(30 * 60))),
             auth_config,
             event_bus: Arc::new(EventBus::new()),
             claim_tracker: Arc::new(LocalClaimTracker::new()),
@@ -75,9 +73,7 @@ impl ProtocolServer {
     ) -> Self {
         Self {
             engine,
-            session_mgr: Arc::new(SessionManager::new(std::time::Duration::from_secs(
-                30 * 60,
-            ))),
+            session_mgr: Arc::new(SessionManager::new(std::time::Duration::from_secs(30 * 60))),
             auth_config,
             event_bus: Arc::new(EventBus::new()),
             claim_tracker,
@@ -87,6 +83,33 @@ impl ProtocolServer {
     /// Validate an auth token against the configured secret.
     pub(crate) fn validate_auth(&self, token: &str) -> Result<String, Status> {
         self.auth_config.validate(token)
+    }
+
+    /// Check whether the bearer token in `metadata` carries admin scope.
+    ///
+    /// Extracts the `authorization: Bearer <token>` header, performs a full
+    /// signature + expiry validation using the server's configured secret, and
+    /// returns `true` when the `scope` claim equals `"admin"` or contains the
+    /// word `"admin"`.
+    ///
+    /// Returns `false` (not an error) if there is no auth header, the token
+    /// is not a JWT, or signature validation fails — callers can then fall
+    /// through to the owner-check.
+    pub(crate) fn has_admin_scope(&self, metadata: &tonic::metadata::MetadataMap) -> bool {
+        let Some(val) = metadata.get("authorization") else {
+            return false;
+        };
+        let Ok(header) = val.to_str() else {
+            return false;
+        };
+        let token = header.strip_prefix("Bearer ").unwrap_or(header);
+        // Perform full signature validation via the configured AuthConfig; only
+        // tokens that pass cryptographic verification can claim admin scope.
+        self.auth_config
+            .validate_claims(token)
+            .as_ref()
+            .map(crate::auth::claims_have_admin_scope)
+            .unwrap_or(false)
     }
 
     /// Look up a session by its string-encoded UUID.  Returns an error if the
@@ -126,7 +149,8 @@ impl crate::agent_service_server::AgentService for ProtocolServer {
         crate::submit::handle_submit(self, request.into_inner()).await
     }
 
-    type VerifyStream = tokio_stream::wrappers::ReceiverStream<Result<crate::VerifyStepResult, Status>>;
+    type VerifyStream =
+        tokio_stream::wrappers::ReceiverStream<Result<crate::VerifyStepResult, Status>>;
 
     async fn verify(
         &self,
@@ -147,7 +171,9 @@ impl crate::agent_service_server::AgentService for ProtocolServer {
             crate::verify::handle_verify(&server_clone, req, tx).await;
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn merge(
@@ -176,7 +202,9 @@ impl crate::agent_service_server::AgentService for ProtocolServer {
         tokio::spawn(async move {
             crate::watch::handle_watch(&server_clone, req, tx).await;
         });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn file_read(
@@ -241,6 +269,13 @@ impl crate::agent_service_server::AgentService for ProtocolServer {
         request: Request<crate::CloseRequest>,
     ) -> Result<Response<crate::CloseResponse>, Status> {
         crate::close::handle_close(self, request.into_inner()).await
+    }
+
+    async fn abandon(
+        &self,
+        request: Request<crate::AbandonRequest>,
+    ) -> Result<Response<crate::AbandonResponse>, Status> {
+        crate::abandon::handle_abandon(self, request).await
     }
 
     async fn review(

@@ -4,10 +4,13 @@
 //! `base_commit` in the repository. Reads go through the overlay first, then
 //! fall back to the Git tree at the base commit.
 
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use dk_core::{AgentId, RepoId, Result};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -96,6 +99,13 @@ pub struct SessionWorkspace {
     pub state: WorkspaceState,
     pub created_at: Instant,
     pub last_active: Instant,
+    /// Per-path wall-clock timestamp of the most recent `dk_file_read` in
+    /// this session. Consumed by the STALE_OVERLAY pre-write check so a
+    /// session whose local view predates a competing submitted changeset is
+    /// forced to re-read before writing. Interior-mutable so it can be
+    /// updated through `&SessionWorkspace` (mirrors how `overlay` manages
+    /// its own locking).
+    pub files_read: Arc<DashMap<String, DateTime<Utc>>>,
 }
 
 impl SessionWorkspace {
@@ -133,6 +143,50 @@ impl SessionWorkspace {
             state: WorkspaceState::Active,
             created_at: now,
             last_active: now,
+            files_read: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Rehydrate a workspace from existing database state without inserting a new row.
+    ///
+    /// Used by [`WorkspaceManager::resume`] to reconstruct an in-memory
+    /// `SessionWorkspace` after the DB row has already been updated (session_id
+    /// rotated, stranded_at cleared). Unlike [`SessionWorkspace::new`], this
+    /// constructor does **not** insert a new `session_workspaces` row — it only
+    /// wires up the in-memory structures pointing at the existing `workspace_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehydrate(
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        repo_id: RepoId,
+        agent_id: AgentId,
+        changeset_id: Uuid,
+        intent: String,
+        base_commit: String,
+        mode: WorkspaceMode,
+        agent_name: String,
+        db: PgPool,
+    ) -> Self {
+        let now = Instant::now();
+        let overlay = FileOverlay::new(workspace_id, db);
+        let graph = SessionGraph::empty();
+
+        Self {
+            id: workspace_id,
+            session_id,
+            repo_id,
+            agent_id,
+            agent_name,
+            changeset_id,
+            intent,
+            base_commit,
+            overlay,
+            graph,
+            mode,
+            state: WorkspaceState::Active,
+            created_at: now,
+            last_active: now,
+            files_read: Arc::new(DashMap::new()),
         }
     }
 
@@ -156,8 +210,8 @@ impl SessionWorkspace {
         sqlx::query(
             r#"
             INSERT INTO session_workspaces
-                (id, session_id, repo_id, base_commit_hash, state, mode, agent_id, intent, agent_name)
-            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8)
+                (id, session_id, repo_id, base_commit_hash, state, mode, agent_id, intent, agent_name, changeset_id)
+            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9)
             "#,
         )
         .bind(id)
@@ -168,6 +222,7 @@ impl SessionWorkspace {
         .bind(&agent_id)
         .bind(&intent)
         .bind(&agent_name)
+        .bind(changeset_id)
         .execute(&db)
         .await?;
 
@@ -189,6 +244,7 @@ impl SessionWorkspace {
             state: WorkspaceState::Active,
             created_at: now,
             last_active: now,
+            files_read: Arc::new(DashMap::new()),
         })
     }
 
@@ -200,13 +256,12 @@ impl SessionWorkspace {
     pub fn read_file(&self, path: &str, git_repo: &GitRepository) -> Result<FileReadResult> {
         if let Some(entry) = self.overlay.get(path) {
             return match entry.value() {
-                OverlayEntry::Modified { content, hash } | OverlayEntry::Added { content, hash } => {
-                    Ok(FileReadResult {
-                        content: content.clone(),
-                        hash: hash.clone(),
-                        modified_in_session: true,
-                    })
-                }
+                OverlayEntry::Modified { content, hash }
+                | OverlayEntry::Added { content, hash } => Ok(FileReadResult {
+                    content: content.clone(),
+                    hash: hash.clone(),
+                    modified_in_session: true,
+                }),
                 OverlayEntry::Deleted => Err(dk_core::Error::Git(format!(
                     "file '{path}' has been deleted in this session"
                 ))),
@@ -310,6 +365,82 @@ impl SessionWorkspace {
         self.last_active = Instant::now();
     }
 
+    /// Record that this session just read `path` at the current wall-clock
+    /// time. Called from `handle_file_read` to feed the STALE_OVERLAY
+    /// pre-write check: a session whose per-path timestamp predates a
+    /// competing submitted changeset touching the same path is forced to
+    /// re-read before the next `dk_file_write` is accepted.
+    pub fn mark_read(&self, path: &str) {
+        self.files_read.insert(path.to_string(), Utc::now());
+    }
+
+    /// Return the wall-clock timestamp of the most recent `dk_file_read`
+    /// for `path`, or `None` if this session has never read it.
+    pub fn last_read(&self, path: &str) -> Option<DateTime<Utc>> {
+        self.files_read.get(path).map(|e| *e.value())
+    }
+
+    /// Re-parse overlay file contents and rebuild the semantic graph.
+    ///
+    /// Called by [`WorkspaceManager::resume`] after the overlay is restored from
+    /// the database. Walks every entry in the overlay, parses supported files,
+    /// and updates the session graph delta accordingly:
+    ///
+    /// - **Deleted** entries: all session-owned symbols for that file are
+    ///   removed from the delta by iterating `added_symbols` and
+    ///   `modified_symbols` and dropping matches.
+    /// - **Added / Modified** entries: the content is re-parsed by the
+    ///   [`ParserRegistry`]. The parse result is fed into
+    ///   [`SessionGraph::update_from_parse`] with an empty base (all symbols
+    ///   in overlay files are session additions — there is no base-symbol set
+    ///   available at this point). Unsupported file extensions are silently
+    ///   skipped.
+    pub async fn reindex_from_overlay(&mut self) -> dk_core::Result<()> {
+        use crate::parser::ParserRegistry;
+        use crate::workspace::overlay::OverlayEntry;
+        use std::path::Path;
+
+        let registry = ParserRegistry::new();
+        let changes = self.overlay.list_changes();
+
+        for (path_str, entry) in changes {
+            let file_path = Path::new(&path_str);
+            match entry {
+                OverlayEntry::Deleted => {
+                    // Remove any session-owned symbols for this file.
+                    self.graph.remove_session_symbols_for_file(&path_str);
+                }
+                OverlayEntry::Added { content, .. } | OverlayEntry::Modified { content, .. } => {
+                    if !registry.supports_file(file_path) {
+                        continue;
+                    }
+                    let text = std::str::from_utf8(&content).map_err(|e| {
+                        dk_core::Error::Internal(format!(
+                            "reindex_from_overlay: non-utf8 in {path_str}: {e}"
+                        ))
+                    })?;
+                    let analysis = match registry.parse_file(file_path, text.as_bytes()) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path_str,
+                                "reindex_from_overlay: parse failed, skipping: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    // All overlay symbols are session additions — pass an empty
+                    // base so update_from_parse classifies all new symbols as
+                    // added and removes none.
+                    self.graph
+                        .update_from_parse(&path_str, analysis.symbols, &[]);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build the overlay vector for `commit_tree_overlay`.
     ///
     /// Returns `(path, Some(content))` for modified/added files and
@@ -327,5 +458,89 @@ impl SessionWorkspace {
                 (path, data)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn make_test_workspace() -> SessionWorkspace {
+        SessionWorkspace::new_test(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "test-agent".to_string(),
+            "test intent".to_string(),
+            "abc123".to_string(),
+            WorkspaceMode::Ephemeral,
+        )
+    }
+
+    #[tokio::test]
+    async fn reindex_from_overlay_adds_symbols_for_rust_file() {
+        let mut ws = make_test_workspace();
+        // Write a Rust file with a single function into the overlay.
+        ws.overlay
+            .write_local("x.rs", b"pub fn hello() {}".to_vec(), true);
+
+        ws.reindex_from_overlay().await.unwrap();
+
+        // The graph should now contain "hello" (added symbol).
+        let symbols = ws.graph.changed_symbols_for_file("x.rs");
+        assert!(
+            symbols.iter().any(|s| s == "hello"),
+            "expected 'hello' in graph symbols, got: {symbols:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_from_overlay_skips_unsupported_extensions() {
+        let mut ws = make_test_workspace();
+        ws.overlay
+            .write_local("readme.txt", b"just text".to_vec(), true);
+
+        // Should not error — unsupported extension is silently skipped.
+        ws.reindex_from_overlay().await.unwrap();
+        assert_eq!(ws.graph.change_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_from_overlay_deleted_entry_clears_symbols() {
+        use dk_core::{Span, Symbol, SymbolKind, Visibility};
+        use std::path::PathBuf;
+
+        let mut ws = make_test_workspace();
+        // Pre-populate the graph with a symbol for the file.
+        ws.graph.add_symbol(Symbol {
+            id: Uuid::new_v4(),
+            name: "old_fn".to_string(),
+            qualified_name: "old_fn".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            file_path: PathBuf::from("gone.rs"),
+            span: Span {
+                start_byte: 0,
+                end_byte: 10,
+            },
+            signature: None,
+            doc_comment: None,
+            parent: None,
+            last_modified_by: None,
+            last_modified_intent: None,
+        });
+        assert_eq!(ws.graph.change_count(), 1);
+
+        // Mark file as deleted in the overlay.
+        ws.overlay.delete_local("gone.rs");
+
+        ws.reindex_from_overlay().await.unwrap();
+
+        // Symbol should have been removed.
+        let symbols = ws.graph.changed_symbols_for_file("gone.rs");
+        assert!(
+            symbols.is_empty(),
+            "deleted file should have no graph symbols"
+        );
     }
 }

@@ -65,6 +65,22 @@ impl ChangesetState {
                 | (Self::Approved, Self::Merged)
         )
     }
+
+    /// True when the changeset is in a terminal state and its backing
+    /// workspace no longer needs to be preserved.
+    ///
+    /// `Draft` is considered terminal because it represents a pre-submit
+    /// workspace that was never progressed — there is no protected in-flight
+    /// state worth pinning.
+    ///
+    /// Used by the workspace pin guard (Epic B) to decide
+    /// whether to evict or skip a candidate workspace.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Draft | Self::Merged | Self::Rejected | Self::Closed
+        )
+    }
 }
 
 impl std::fmt::Display for ChangesetState {
@@ -93,6 +109,10 @@ pub struct Changeset {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub merged_at: Option<DateTime<Utc>>,
+    /// Stacked-changeset parent. PR1 ships the column additively — nothing
+    /// populates it and no consumer reads it. PR2 will set it at submit
+    /// time and enforce merge-order on the chain.
+    pub parent_changeset_id: Option<Uuid>,
 }
 
 impl Changeset {
@@ -143,15 +163,15 @@ pub struct ChangesetFileMeta {
 /// A single AI-generated review result, as stored in `changeset_ai_reviews`.
 #[derive(Debug, Clone)]
 pub struct AiReview {
-    pub id:          Uuid,
-    pub tier:        String,
-    pub score:       Option<i32>,
-    pub summary:     Option<String>,
-    pub findings:    serde_json::Value,
-    pub provider:    String,
-    pub model:       String,
+    pub id: Uuid,
+    pub tier: String,
+    pub score: Option<i32>,
+    pub summary: Option<String>,
+    pub findings: serde_json::Value,
+    pub provider: String,
+    pub model: String,
     pub duration_ms: i64,
-    pub created_at:  chrono::DateTime<chrono::Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct ChangesetStore {
@@ -180,7 +200,13 @@ impl ChangesetStore {
         let intent_slug: String = intent
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>()
             .trim_matches('-')
             .to_string();
@@ -246,6 +272,7 @@ impl ChangesetStore {
             created_at: row.4,
             updated_at: row.5,
             merged_at: None,
+            parent_changeset_id: None,
         })
     }
 
@@ -255,7 +282,8 @@ impl ChangesetStore {
                       source_branch, target_branch, state, reason,
                       session_id, agent_id, agent_name, author_id,
                       base_version, merged_version,
-                      created_at, updated_at, merged_at
+                      created_at, updated_at, merged_at,
+                      parent_changeset_id
                FROM changesets WHERE id = $1"#,
         )
         .bind(id)
@@ -295,7 +323,8 @@ impl ChangesetStore {
         new_status: &str,
         expected_states: &[&str],
     ) -> dk_core::Result<()> {
-        self.update_status_if_with_reason(id, new_status, expected_states, "").await
+        self.update_status_if_with_reason(id, new_status, expected_states, "")
+            .await
     }
 
     /// Like `update_status_if` but also records a reason for the transition.
@@ -381,7 +410,10 @@ impl ChangesetStore {
 
     /// Lightweight query returning only file metadata (path, operation, size)
     /// without loading the full content column.
-    pub async fn get_files_metadata(&self, changeset_id: Uuid) -> dk_core::Result<Vec<ChangesetFileMeta>> {
+    pub async fn get_files_metadata(
+        &self,
+        changeset_id: Uuid,
+    ) -> dk_core::Result<Vec<ChangesetFileMeta>> {
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT file_path, operation, COALESCE(LENGTH(content), 0)::bigint AS size_bytes FROM changeset_files WHERE changeset_id = $1",
         )
@@ -418,7 +450,10 @@ impl ChangesetStore {
         Ok(())
     }
 
-    pub async fn get_affected_symbols(&self, changeset_id: Uuid) -> dk_core::Result<Vec<(SymbolId, String)>> {
+    pub async fn get_affected_symbols(
+        &self,
+        changeset_id: Uuid,
+    ) -> dk_core::Result<Vec<(SymbolId, String)>> {
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT symbol_id, symbol_qualified_name FROM changeset_symbols WHERE changeset_id = $1",
         )
@@ -474,26 +509,76 @@ impl ChangesetStore {
     }
 
     /// Retrieve all AI review results for a changeset, ordered oldest-first.
-    pub async fn get_ai_reviews(
-        &self,
-        changeset_id: Uuid,
-    ) -> dk_core::Result<Vec<AiReview>> {
-        let rows: Vec<(Uuid, String, Option<i32>, Option<String>, serde_json::Value, String, String, i64, chrono::DateTime<chrono::Utc>)> =
-            sqlx::query_as(
-                "SELECT id, tier, score, summary, findings, provider, model, duration_ms, created_at \
+    #[allow(clippy::type_complexity)]
+    pub async fn get_ai_reviews(&self, changeset_id: Uuid) -> dk_core::Result<Vec<AiReview>> {
+        let rows: Vec<(
+            Uuid,
+            String,
+            Option<i32>,
+            Option<String>,
+            serde_json::Value,
+            String,
+            String,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT id, tier, score, summary, findings, provider, model, duration_ms, created_at \
                  FROM changeset_ai_reviews \
                  WHERE changeset_id = $1 \
                  ORDER BY created_at ASC",
-            )
-            .bind(changeset_id)
-            .fetch_all(&self.db)
-            .await?;
+        )
+        .bind(changeset_id)
+        .fetch_all(&self.db)
+        .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, tier, score, summary, findings, provider, model, duration_ms, created_at)| {
-                AiReview { id, tier, score, summary, findings, provider, model, duration_ms, created_at }
-            })
+            .map(
+                |(id, tier, score, summary, findings, provider, model, duration_ms, created_at)| {
+                    AiReview {
+                        id,
+                        tier,
+                        score,
+                        summary,
+                        findings,
+                        provider,
+                        model,
+                        duration_ms,
+                        created_at,
+                    }
+                },
+            )
             .collect())
+    }
+
+    /// List live competitors on a file path.
+    ///
+    /// Returns every changeset in `{submitted, verifying, approved}` for
+    /// `repo_id` that has a `changeset_files` row for `path`. `draft`,
+    /// `merged`, `rejected`, and `closed` are filtered at the SQL level —
+    /// `draft` is session-local, `merged` is handled by the AST merger at
+    /// `dk_merge`, and the rest are inert. Policy (self-exclusion, stale
+    /// comparison vs. session read timestamp) is applied by the pure
+    /// `dk_protocol::stale_overlay::is_stale` helper.
+    ///
+    /// Used by the STALE_OVERLAY pre-write check in `handle_file_write`.
+    pub async fn list_path_competitors(
+        &self,
+        repo_id: RepoId,
+        path: &str,
+    ) -> dk_core::Result<Vec<(Uuid, Option<Uuid>, String, DateTime<Utc>)>> {
+        let rows: Vec<(Uuid, Option<Uuid>, String, DateTime<Utc>)> = sqlx::query_as(
+            r#"SELECT c.id, c.session_id, c.state, c.updated_at
+               FROM changesets c
+               JOIN changeset_files cf ON cf.changeset_id = c.id
+               WHERE c.repo_id = $1
+                 AND cf.file_path = $2
+                 AND c.state IN ('submitted', 'verifying', 'approved')"#,
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows)
     }
 
     /// Find changesets that conflict with ours.
@@ -524,7 +609,8 @@ impl ChangesetStore {
         .fetch_all(&self.db)
         .await?;
 
-        let mut map: std::collections::HashMap<Uuid, Vec<String>> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<Uuid, Vec<String>> =
+            std::collections::HashMap::new();
         for (cs_id, sym_name) in rows {
             map.entry(cs_id).or_default().push(sym_name);
         }
@@ -542,7 +628,13 @@ mod tests {
         let slug: String = intent
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>()
             .trim_matches('-')
             .to_string();
@@ -576,62 +668,21 @@ mod tests {
         assert_eq!(target_branch, "main");
     }
 
-    /// Verify that a manually-constructed Changeset (matching the shape
-    /// returned by `create()`) has the correct branch and agent fields.
-    #[test]
-    fn changeset_create_shape_has_correct_branches() {
-        let repo_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let agent_id = "test-agent";
-        let intent = "fix all the bugs";
-
-        let source_branch = format!("agent/{}", agent_id);
+    /// Test scaffolding fixture: a "draft" Changeset with sensible defaults
+    /// (empty/None for nullable fields, "main" as target, now() for
+    /// timestamps). Tests override only the fields they actually care about
+    /// via struct-update syntax (`..test_changeset_fixture()`), which keeps
+    /// each test focused and prevents every new struct field from forcing
+    /// an edit across every test literal.
+    fn test_changeset_fixture() -> Changeset {
         let now = Utc::now();
-
-        let cs = Changeset {
+        Changeset {
             id: Uuid::new_v4(),
-            repo_id,
+            repo_id: Uuid::new_v4(),
             number: 1,
-            title: intent.to_string(),
-            intent_summary: Some(intent.to_string()),
-            source_branch: source_branch.clone(),
-            target_branch: "main".to_string(),
-            state: "draft".to_string(),
-            reason: String::new(),
-            session_id: Some(session_id),
-            agent_id: Some(agent_id.to_string()),
-            agent_name: Some(agent_id.to_string()),
-            author_id: None,
-            base_version: Some("abc123".to_string()),
-            merged_version: None,
-            created_at: now,
-            updated_at: now,
-            merged_at: None,
-        };
-
-        assert_eq!(cs.source_branch, "agent/test-agent");
-        assert_eq!(cs.target_branch, "main");
-        assert_eq!(cs.agent_name.as_deref(), Some("test-agent"));
-        assert_eq!(cs.agent_id, cs.agent_name, "agent_name should equal agent_id per create()");
-        assert!(cs.merged_at.is_none());
-        assert!(cs.merged_version.is_none());
-    }
-
-    /// Verify the Changeset struct fields are all accessible and have
-    /// the expected types (compile-time check + runtime assertions).
-    #[test]
-    fn changeset_all_fields_accessible() {
-        let now = Utc::now();
-        let id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
-
-        let cs = Changeset {
-            id,
-            repo_id,
-            number: 42,
-            title: "test".to_string(),
+            title: String::new(),
             intent_summary: None,
-            source_branch: "agent/a".to_string(),
+            source_branch: "agent/test".to_string(),
             target_branch: "main".to_string(),
             state: "draft".to_string(),
             reason: String::new(),
@@ -644,6 +695,58 @@ mod tests {
             created_at: now,
             updated_at: now,
             merged_at: None,
+            parent_changeset_id: None,
+        }
+    }
+
+    /// Verify that a manually-constructed Changeset (matching the shape
+    /// returned by `create()`) has the correct branch and agent fields.
+    #[test]
+    fn changeset_create_shape_has_correct_branches() {
+        let repo_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let agent_id = "test-agent";
+        let intent = "fix all the bugs";
+
+        let source_branch = format!("agent/{}", agent_id);
+
+        let cs = Changeset {
+            repo_id,
+            title: intent.to_string(),
+            intent_summary: Some(intent.to_string()),
+            source_branch: source_branch.clone(),
+            session_id: Some(session_id),
+            agent_id: Some(agent_id.to_string()),
+            agent_name: Some(agent_id.to_string()),
+            base_version: Some("abc123".to_string()),
+            ..test_changeset_fixture()
+        };
+
+        assert_eq!(cs.source_branch, "agent/test-agent");
+        assert_eq!(cs.target_branch, "main");
+        assert_eq!(cs.agent_name.as_deref(), Some("test-agent"));
+        assert_eq!(
+            cs.agent_id, cs.agent_name,
+            "agent_name should equal agent_id per create()"
+        );
+        assert!(cs.merged_at.is_none());
+        assert!(cs.merged_version.is_none());
+    }
+
+    /// Verify the Changeset struct fields are all accessible and have
+    /// the expected types (compile-time check + runtime assertions).
+    #[test]
+    fn changeset_all_fields_accessible() {
+        let id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+
+        let cs = Changeset {
+            id,
+            repo_id,
+            number: 42,
+            title: "test".to_string(),
+            source_branch: "agent/a".to_string(),
+            ..test_changeset_fixture()
         };
 
         assert_eq!(cs.id, id);
@@ -687,26 +790,13 @@ mod tests {
 
     #[test]
     fn changeset_clone_produces_equal_values() {
-        let now = Utc::now();
         let cs = Changeset {
-            id: Uuid::new_v4(),
-            repo_id: Uuid::new_v4(),
-            number: 1,
             title: "clone test".to_string(),
             intent_summary: Some("intent".to_string()),
             source_branch: "agent/x".to_string(),
-            target_branch: "main".to_string(),
-            state: "draft".to_string(),
-            reason: String::new(),
-            session_id: None,
             agent_id: Some("x".to_string()),
             agent_name: Some("x".to_string()),
-            author_id: None,
-            base_version: None,
-            merged_version: None,
-            created_at: now,
-            updated_at: now,
-            merged_at: None,
+            ..test_changeset_fixture()
         };
 
         let cloned = cs.clone();
@@ -714,5 +804,16 @@ mod tests {
         assert_eq!(cs.source_branch, cloned.source_branch);
         assert_eq!(cs.target_branch, cloned.target_branch);
         assert_eq!(cs.state, cloned.state);
+    }
+
+    #[test]
+    fn is_terminal_partitions_changeset_states() {
+        assert!(!ChangesetState::Submitted.is_terminal());
+        assert!(!ChangesetState::Verifying.is_terminal());
+        assert!(!ChangesetState::Approved.is_terminal());
+        assert!(ChangesetState::Merged.is_terminal());
+        assert!(ChangesetState::Rejected.is_terminal());
+        assert!(ChangesetState::Closed.is_terminal());
+        assert!(ChangesetState::Draft.is_terminal()); // Draft: pre-submit, not worth pinning
     }
 }
