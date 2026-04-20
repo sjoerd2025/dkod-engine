@@ -65,6 +65,22 @@ impl ChangesetState {
                 | (Self::Approved, Self::Merged)
         )
     }
+
+    /// True when the changeset is in a terminal state and its backing
+    /// workspace no longer needs to be preserved.
+    ///
+    /// `Draft` is considered terminal because it represents a pre-submit
+    /// workspace that was never progressed — there is no protected in-flight
+    /// state worth pinning.
+    ///
+    /// Used by the workspace pin guard (Epic B) to decide
+    /// whether to evict or skip a candidate workspace.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Draft | Self::Merged | Self::Rejected | Self::Closed
+        )
+    }
 }
 
 impl std::fmt::Display for ChangesetState {
@@ -93,6 +109,10 @@ pub struct Changeset {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub merged_at: Option<DateTime<Utc>>,
+    /// Stacked-changeset parent. PR1 ships the column additively — nothing
+    /// populates it and no consumer reads it. PR2 will set it at submit
+    /// time and enforce merge-order on the chain.
+    pub parent_changeset_id: Option<Uuid>,
 }
 
 impl Changeset {
@@ -252,6 +272,7 @@ impl ChangesetStore {
             created_at: row.4,
             updated_at: row.5,
             merged_at: None,
+            parent_changeset_id: None,
         })
     }
 
@@ -261,7 +282,8 @@ impl ChangesetStore {
                       source_branch, target_branch, state, reason,
                       session_id, agent_id, agent_name, author_id,
                       base_version, merged_version,
-                      created_at, updated_at, merged_at
+                      created_at, updated_at, merged_at,
+                      parent_changeset_id
                FROM changesets WHERE id = $1"#,
         )
         .bind(id)
@@ -528,6 +550,37 @@ impl ChangesetStore {
             .collect())
     }
 
+    /// List live competitors on a file path.
+    ///
+    /// Returns every changeset in `{submitted, verifying, approved}` for
+    /// `repo_id` that has a `changeset_files` row for `path`. `draft`,
+    /// `merged`, `rejected`, and `closed` are filtered at the SQL level —
+    /// `draft` is session-local, `merged` is handled by the AST merger at
+    /// `dk_merge`, and the rest are inert. Policy (self-exclusion, stale
+    /// comparison vs. session read timestamp) is applied by the pure
+    /// `dk_protocol::stale_overlay::is_stale` helper.
+    ///
+    /// Used by the STALE_OVERLAY pre-write check in `handle_file_write`.
+    pub async fn list_path_competitors(
+        &self,
+        repo_id: RepoId,
+        path: &str,
+    ) -> dk_core::Result<Vec<(Uuid, Option<Uuid>, String, DateTime<Utc>)>> {
+        let rows: Vec<(Uuid, Option<Uuid>, String, DateTime<Utc>)> = sqlx::query_as(
+            r#"SELECT c.id, c.session_id, c.state, c.updated_at
+               FROM changesets c
+               JOIN changeset_files cf ON cf.changeset_id = c.id
+               WHERE c.repo_id = $1
+                 AND cf.file_path = $2
+                 AND c.state IN ('submitted', 'verifying', 'approved')"#,
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows)
+    }
+
     /// Find changesets that conflict with ours.
     /// Only considers changesets merged AFTER our base_version —
     /// i.e. changes the agent didn't know about when it started.
@@ -615,6 +668,37 @@ mod tests {
         assert_eq!(target_branch, "main");
     }
 
+    /// Test scaffolding fixture: a "draft" Changeset with sensible defaults
+    /// (empty/None for nullable fields, "main" as target, now() for
+    /// timestamps). Tests override only the fields they actually care about
+    /// via struct-update syntax (`..test_changeset_fixture()`), which keeps
+    /// each test focused and prevents every new struct field from forcing
+    /// an edit across every test literal.
+    fn test_changeset_fixture() -> Changeset {
+        let now = Utc::now();
+        Changeset {
+            id: Uuid::new_v4(),
+            repo_id: Uuid::new_v4(),
+            number: 1,
+            title: String::new(),
+            intent_summary: None,
+            source_branch: "agent/test".to_string(),
+            target_branch: "main".to_string(),
+            state: "draft".to_string(),
+            reason: String::new(),
+            session_id: None,
+            agent_id: None,
+            agent_name: None,
+            author_id: None,
+            base_version: None,
+            merged_version: None,
+            created_at: now,
+            updated_at: now,
+            merged_at: None,
+            parent_changeset_id: None,
+        }
+    }
+
     /// Verify that a manually-constructed Changeset (matching the shape
     /// returned by `create()`) has the correct branch and agent fields.
     #[test]
@@ -625,27 +709,17 @@ mod tests {
         let intent = "fix all the bugs";
 
         let source_branch = format!("agent/{}", agent_id);
-        let now = Utc::now();
 
         let cs = Changeset {
-            id: Uuid::new_v4(),
             repo_id,
-            number: 1,
             title: intent.to_string(),
             intent_summary: Some(intent.to_string()),
             source_branch: source_branch.clone(),
-            target_branch: "main".to_string(),
-            state: "draft".to_string(),
-            reason: String::new(),
             session_id: Some(session_id),
             agent_id: Some(agent_id.to_string()),
             agent_name: Some(agent_id.to_string()),
-            author_id: None,
             base_version: Some("abc123".to_string()),
-            merged_version: None,
-            created_at: now,
-            updated_at: now,
-            merged_at: None,
+            ..test_changeset_fixture()
         };
 
         assert_eq!(cs.source_branch, "agent/test-agent");
@@ -663,7 +737,6 @@ mod tests {
     /// the expected types (compile-time check + runtime assertions).
     #[test]
     fn changeset_all_fields_accessible() {
-        let now = Utc::now();
         let id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
 
@@ -672,20 +745,8 @@ mod tests {
             repo_id,
             number: 42,
             title: "test".to_string(),
-            intent_summary: None,
             source_branch: "agent/a".to_string(),
-            target_branch: "main".to_string(),
-            state: "draft".to_string(),
-            reason: String::new(),
-            session_id: None,
-            agent_id: None,
-            agent_name: None,
-            author_id: None,
-            base_version: None,
-            merged_version: None,
-            created_at: now,
-            updated_at: now,
-            merged_at: None,
+            ..test_changeset_fixture()
         };
 
         assert_eq!(cs.id, id);
@@ -729,26 +790,13 @@ mod tests {
 
     #[test]
     fn changeset_clone_produces_equal_values() {
-        let now = Utc::now();
         let cs = Changeset {
-            id: Uuid::new_v4(),
-            repo_id: Uuid::new_v4(),
-            number: 1,
             title: "clone test".to_string(),
             intent_summary: Some("intent".to_string()),
             source_branch: "agent/x".to_string(),
-            target_branch: "main".to_string(),
-            state: "draft".to_string(),
-            reason: String::new(),
-            session_id: None,
             agent_id: Some("x".to_string()),
             agent_name: Some("x".to_string()),
-            author_id: None,
-            base_version: None,
-            merged_version: None,
-            created_at: now,
-            updated_at: now,
-            merged_at: None,
+            ..test_changeset_fixture()
         };
 
         let cloned = cs.clone();
@@ -756,5 +804,16 @@ mod tests {
         assert_eq!(cs.source_branch, cloned.source_branch);
         assert_eq!(cs.target_branch, cloned.target_branch);
         assert_eq!(cs.state, cloned.state);
+    }
+
+    #[test]
+    fn is_terminal_partitions_changeset_states() {
+        assert!(!ChangesetState::Submitted.is_terminal());
+        assert!(!ChangesetState::Verifying.is_terminal());
+        assert!(!ChangesetState::Approved.is_terminal());
+        assert!(ChangesetState::Merged.is_terminal());
+        assert!(ChangesetState::Rejected.is_terminal());
+        assert!(ChangesetState::Closed.is_terminal());
+        assert!(ChangesetState::Draft.is_terminal()); // Draft: pre-submit, not worth pinning
     }
 }

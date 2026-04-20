@@ -18,6 +18,7 @@ pub async fn handle_merge(
     req: MergeRequest,
 ) -> Result<MergeResponse, Status> {
     let session = server.validate_session(&req.session_id)?;
+    crate::require_live_session::require_live_session(server, &req.session_id).await?;
     let engine = server.engine();
 
     let sid = req
@@ -104,7 +105,16 @@ pub async fn handle_merge(
         WorkspaceMergeResult::FastMerge { commit_hash } => {
             // Release locks first — git commit is already in the tree,
             // so locks must be freed regardless of changeset-store state.
-            release_locks_and_emit(server, repo_id, sid, &req.session_id).await;
+            // Idempotent: if locks were already released at submit under
+            // DKOD_RELEASE_ON_SUBMIT, this is a no-op.
+            release_locks_and_emit(
+                server,
+                repo_id,
+                sid,
+                &req.session_id,
+                &changeset_id.to_string(),
+            )
+            .await;
 
             // Update changeset status to merged
             engine
@@ -151,7 +161,15 @@ pub async fn handle_merge(
             auto_rebased_files,
         } => {
             // Release locks first — git commit is already in the tree.
-            release_locks_and_emit(server, repo_id, sid, &req.session_id).await;
+            // Idempotent w.r.t. a prior release at submit (see FastMerge arm).
+            release_locks_and_emit(
+                server,
+                repo_id,
+                sid,
+                &req.session_id,
+                &changeset_id.to_string(),
+            )
+            .await;
 
             // Update changeset status to merged
             engine
@@ -248,22 +266,32 @@ pub async fn handle_merge(
     }
 }
 
-/// Release all symbol locks for a session and emit `symbol.lock.released` events
-/// so blocked agents can wake up and retry their writes.
-async fn release_locks_and_emit(
+/// Release all symbol locks for a session and emit `symbol.lock.released`
+/// events so blocked agents can wake up and retry their writes.
+///
+/// Returns the number of locks released, which callers can surface to the
+/// agent (e.g. in the `dk_submit` success response) so parallel-aware flows
+/// have a clear cue that contention was lifted. Idempotent: re-calling
+/// after an earlier release simply returns 0, which makes it safe for both
+/// `handle_submit` (flag-gated early release) and `handle_merge` (always-on
+/// cleanup) to call it.
+pub(crate) async fn release_locks_and_emit(
     server: &ProtocolServer,
     repo_id: Uuid,
     session_id: Uuid,
     session_id_str: &str,
-) {
+    changeset_id: &str,
+) -> usize {
     let released = server
         .claim_tracker()
         .release_locks(repo_id, session_id)
         .await;
 
     if released.is_empty() {
-        return;
+        return 0;
     }
+
+    let count = released.len();
 
     // Group released locks by file_path for efficient event emission
     let mut by_file: std::collections::HashMap<String, Vec<String>> =
@@ -278,7 +306,7 @@ async fn release_locks_and_emit(
     for (file_path, symbols) in by_file {
         server.event_bus().publish(crate::WatchEvent {
             event_type: EVENT_LOCK_RELEASED.to_string(),
-            changeset_id: String::new(),
+            changeset_id: changeset_id.to_string(),
             agent_id: released
                 .first()
                 .map(|r| r.agent_name.clone())
@@ -295,12 +323,18 @@ async fn release_locks_and_emit(
             event_id: Uuid::new_v4().to_string(),
         });
     }
+
+    count
 }
 
 // ── Event type constants ────────────────────────────────────────────
 
 /// Event published when a changeset is successfully merged.
 pub const EVENT_MERGED: &str = "changeset.merged";
+
+/// Event published when symbol locks are released (after merge, close, or timeout).
+/// Blocked agents watch for this to retry their `dk_file_write`.
+pub const EVENT_LOCK_RELEASED: &str = "symbol.lock.released";
 
 /// Emit a `changeset_lifecycle` row to the process-global analytics sink.
 ///
@@ -329,10 +363,6 @@ fn emit_lifecycle_event(
         },
     ));
 }
-
-/// Event published when symbol locks are released (after merge, close, or timeout).
-/// Blocked agents watch for this to retry their `dk_file_write`.
-pub const EVENT_LOCK_RELEASED: &str = "symbol.lock.released";
 
 #[cfg(test)]
 mod tests {

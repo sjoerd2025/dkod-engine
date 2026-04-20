@@ -16,6 +16,8 @@ mod conflict_payload_test;
 mod cpp_parser_test;
 #[path = "integration/csharp_parser_test.rs"]
 mod csharp_parser_test;
+#[path = "integration/eviction_recovery_test.rs"]
+mod eviction_recovery_test;
 #[path = "integration/git_test.rs"]
 mod git_test;
 #[path = "integration/go_parser_test.rs"]

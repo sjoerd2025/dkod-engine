@@ -152,6 +152,9 @@ enum Commands {
         action: FilesAction,
     },
 
+    /// Admin operations (requires admin JWT scope)
+    Admin(commands::admin::AdminArgs),
+
     /// Index a repository for semantic search
     Index {
         /// Repository name
@@ -302,6 +305,9 @@ fn main() -> Result<()> {
     }
 
     let out = Output::new(cli.json);
+    // Keep the raw Option so subcommands (e.g. admin) that do their own
+    // server resolution can also inherit the global flag.
+    let global_server_opt = cli.server.clone();
     let server = cli.server.unwrap_or_else(|| DEFAULT_SERVER.to_string());
 
     match cli.command {
@@ -336,6 +342,11 @@ fn main() -> Result<()> {
         Commands::Status => run_async(commands::session_status::run(out)),
         Commands::Diff => run_async(commands::session_diff::run(out)),
         Commands::Login => run_async(commands::device_login::run(out, &server)),
+        Commands::Admin(args) => {
+            // Pass the global --server value so `dk --server <addr> admin abandon`
+            // routes to the right server even when the subcommand flag is omitted.
+            run_async(commands::admin::run(args, global_server_opt))
+        }
 
         // ── Git subcommands ──────────────────────────────────
         Commands::Git { action } => match action {

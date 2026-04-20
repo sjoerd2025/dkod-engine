@@ -13,7 +13,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# 0.3.0 makes release-locks-at-submit + STALE_OVERLAY the default. Operators
+# can opt out with `DKOD_RELEASE_ON_SUBMIT=0` (the flag is preserved as a
+# rollback valve). 0.2.0 shipped the same code gated off; 0.3.0 flips the
+# default to on after the testbed validated zero regressions.
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dkod-io/dkod-engine"
@@ -39,11 +43,11 @@ serde_yml = "0.0.12"
 rmp-serde = "1"
 
 # Internal crates
-dk-core = { path = "crates/dk-core", version = "0.1.0" }
-dk-engine = { path = "crates/dk-engine", version = "0.1.0" }
-dk-protocol = { path = "crates/dk-protocol", version = "0.1.0" }
-dk-runner = { path = "crates/dk-runner", version = "0.1.0" }
-dk-agent-sdk = { path = "crates/dk-agent-sdk", version = "0.1.0" }
-dk-server = { path = "crates/dk-server", version = "0.1.0" }
-dk-mcp = { path = "crates/dk-mcp", version = "0.1.0" }
-dk-analytics = { path = "crates/dk-analytics", version = "0.1.0" }
+dk-core = { path = "crates/dk-core", version = "0.3.0" }
+dk-engine = { path = "crates/dk-engine", version = "0.3.0" }
+dk-protocol = { path = "crates/dk-protocol", version = "0.3.0" }
+dk-runner = { path = "crates/dk-runner", version = "0.3.0" }
+dk-agent-sdk = { path = "crates/dk-agent-sdk", version = "0.3.0" }
+dk-server = { path = "crates/dk-server", version = "0.3.0" }
+dk-mcp = { path = "crates/dk-mcp", version = "0.3.0" }
+dk-analytics = { path = "crates/dk-analytics", version = "0.3.0" }

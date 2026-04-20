@@ -8,6 +8,7 @@ pub mod generated;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use generated::dkod::v1::*;
 
+pub(crate) mod abandon;
 pub mod approve;
 pub mod auth;
 pub mod close;
@@ -18,9 +19,11 @@ pub mod file_list;
 pub mod file_read;
 pub mod file_write;
 pub mod merge;
+pub mod metrics;
 pub mod pre_submit;
 pub mod push;
 pub mod record_review;
+pub(crate) mod require_live_session;
 pub mod resolve;
 pub mod review;
 pub mod server;
@@ -29,6 +32,7 @@ pub mod session;
 pub mod session_redis;
 pub mod session_status;
 pub mod session_store;
+pub mod stale_overlay;
 pub mod submit;
 pub mod validation;
 pub mod verify;

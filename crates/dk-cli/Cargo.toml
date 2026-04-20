@@ -28,6 +28,7 @@ ignore = "0.4"
 urlencoding = "2"
 walkdir = "2"
 rpassword = "7"
+uuid.workspace = true
 dk-agent-sdk.workspace = true
 dk-analytics.workspace = true
 dk-protocol.workspace = true

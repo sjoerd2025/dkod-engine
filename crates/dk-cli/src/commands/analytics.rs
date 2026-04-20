@@ -38,11 +38,62 @@ pub enum AnalyticsAction {
         /// table on the warehouse side).
         #[arg(long)]
         repo: String,
-        /// Lower bound for `created_at` (any format ClickHouse accepts,
-        /// e.g. `2024-01-01` or `now() - INTERVAL 7 DAY`).
+        /// Lower bound for `created_at` / `transition_at`.
+        ///
+        /// Date-like values (e.g. `2024-01-01` or `2024-01-01T12:00:00`)
+        /// are automatically quoted. ClickHouse expressions matching
+        /// `now() [± INTERVAL N UNIT]` are passed through verbatim.
+        /// Any other shape is rejected to avoid SQL injection.
         #[arg(long, default_value = "now() - INTERVAL 7 DAY")]
         since: String,
     },
+}
+
+/// Validate `--since` and render a ClickHouse SQL fragment for it.
+///
+/// Only two shapes are accepted:
+/// 1. A date or datetime literal (ISO-ish). We quote it.
+/// 2. A `now()`-rooted expression with optional `± INTERVAL N UNIT`.
+///
+/// Everything else is rejected so an attacker (or a confused operator)
+/// cannot inject arbitrary SQL via the flag.
+fn render_since(since: &str) -> Result<String> {
+    let s = since.trim();
+    let date_like = |c: char| c.is_ascii_digit() || c == '-' || c == ':' || c == 'T' || c == ' ';
+    if !s.is_empty() && s.chars().all(date_like) {
+        // Treat as a literal and quote it.
+        return Ok(format!("'{s}'"));
+    }
+
+    // Allow a small whitelist of now()-rooted expressions.
+    let normalised: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = normalised.to_ascii_lowercase();
+    let is_now_expr = lowered == "now()"
+        || lowered
+            .strip_prefix("now() - interval ")
+            .or_else(|| lowered.strip_prefix("now() + interval "))
+            .map(|rest| {
+                let mut it = rest.split_whitespace();
+                let n = it.next();
+                let unit = it.next();
+                let tail = it.next();
+                matches!(
+                    (n, unit, tail),
+                    (
+                        Some(n),
+                        Some("second" | "minute" | "hour" | "day" | "week" | "month" | "year"),
+                        None,
+                    ) if n.chars().all(|c| c.is_ascii_digit())
+                )
+            })
+            .unwrap_or(false);
+    if is_now_expr {
+        return Ok(normalised);
+    }
+
+    anyhow::bail!(
+        "--since must be a date (e.g. 2024-01-01) or a `now() [± INTERVAL N {{second|minute|hour|day|week|month|year}}]` expression, got: {since}"
+    )
 }
 
 pub async fn run(action: AnalyticsAction) -> Result<()> {
@@ -92,6 +143,7 @@ pub async fn run(action: AnalyticsAction) -> Result<()> {
 /// trivially readable and lets us bail early with a good error message
 /// if any single one fails.
 async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str) -> Result<()> {
+    let since_sql = render_since(since)?;
     println!(
         "{} over window `{}`",
         format!("Summary for repo {repo}").bold(),
@@ -106,7 +158,7 @@ async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str
     let _ = repo; // reserved for future per-repo filter once repo_id lookup exists.
     let merged_sql = format!(
         "SELECT toString(count()) FROM changeset_lifecycle \
-         WHERE state = 'merged' AND transition_at >= {since}"
+         WHERE state = 'merged' AND transition_at >= {since_sql}"
     );
     let merged: String = client
         .inner()
@@ -118,7 +170,7 @@ async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str
 
     let avg_sql = format!(
         "SELECT toString(round(avg(duration_ms))) FROM verification_runs \
-         WHERE created_at >= {since}"
+         WHERE created_at >= {since_sql}"
     );
     let avg: String = client
         .inner()
@@ -130,7 +182,7 @@ async fn summary(client: &dk_analytics::AnalyticsClient, repo: &str, since: &str
 
     let verdicts_sql = format!(
         "SELECT verdict || ':' || toString(count()) FROM review_results \
-         WHERE created_at >= {since} GROUP BY verdict"
+         WHERE created_at >= {since_sql} GROUP BY verdict"
     );
     let verdicts: Vec<String> = client
         .inner()

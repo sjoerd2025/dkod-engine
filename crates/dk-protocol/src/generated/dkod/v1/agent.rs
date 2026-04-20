@@ -781,6 +781,62 @@ pub struct CloseResponse {
     #[prost(string, tag = "3")]
     pub session_id: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AbandonRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AbandonResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub changeset_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub abandoned_reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionStrandedDetail {
+    #[prost(string, tag = "1")]
+    pub changeset_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub base_commit: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub stranded_reason: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub stranded_at_rfc3339: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResumeContendedDetail {
+    #[prost(message, repeated, tag = "1")]
+    pub symbols: ::prost::alloc::vec::Vec<resume_contended_detail::ConflictingSymbol>,
+}
+/// Nested message and enum types in `ResumeContendedDetail`.
+pub mod resume_contended_detail {
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct ConflictingSymbol {
+        #[prost(string, tag = "1")]
+        pub qualified_name: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub file_path: ::prost::alloc::string::String,
+        #[prost(string, tag = "3")]
+        pub claimant_session: ::prost::alloc::string::String,
+        #[prost(string, tag = "4")]
+        pub claimant_agent: ::prost::alloc::string::String,
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AlreadyResumedDetail {
+    #[prost(string, tag = "1")]
+    pub new_session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionAbandonedDetail {
+    #[prost(string, tag = "1")]
+    pub changeset_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub abandoned_reason: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WorkspaceMode {
@@ -1404,6 +1460,31 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("dkod.v1.AgentService", "Close"));
             self.inner.unary(req, path, codec).await
         }
+        /// Abandon a session, discarding its changeset and releasing all locks
+        pub async fn abandon(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AbandonRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AbandonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/dkod.v1.AgentService/Abandon",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("dkod.v1.AgentService", "Abandon"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Get code review results for a changeset
         pub async fn review(
             &mut self,
@@ -1563,6 +1644,11 @@ pub mod agent_service_server {
             &self,
             request: tonic::Request<super::CloseRequest>,
         ) -> std::result::Result<tonic::Response<super::CloseResponse>, tonic::Status>;
+        /// Abandon a session, discarding its changeset and releasing all locks
+        async fn abandon(
+            &self,
+            request: tonic::Request<super::AbandonRequest>,
+        ) -> std::result::Result<tonic::Response<super::AbandonResponse>, tonic::Status>;
         /// Get code review results for a changeset
         async fn review(
             &self,
@@ -2312,6 +2398,51 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CloseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/dkod.v1.AgentService/Abandon" => {
+                    #[allow(non_camel_case_types)]
+                    struct AbandonSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::AbandonRequest>
+                    for AbandonSvc<T> {
+                        type Response = super::AbandonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AbandonRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::abandon(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AbandonSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
