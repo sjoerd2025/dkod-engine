@@ -36,13 +36,13 @@ fn query_csv_groups_by_level() {
     .unwrap();
 
     let text = out.as_utf8_lossy();
-    // fixture has: info ×4, error ×3, warn ×2
+    // fixture has: info ×5, error ×3, warn ×2
     let info_idx = text.find(r#""level":"info""#).expect("info row present");
     let error_idx = text.find(r#""level":"error""#).expect("error row present");
     let warn_idx = text.find(r#""level":"warn""#).expect("warn row present");
     assert!(
         info_idx < error_idx && error_idx < warn_idx,
-        "rows should be sorted info (4), error (3), warn (2); got:\n{text}"
+        "rows should be sorted info (5), error (3), warn (2); got:\n{text}"
     );
 }
 
