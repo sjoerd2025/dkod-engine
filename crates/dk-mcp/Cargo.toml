@@ -30,6 +30,7 @@ dirs = "6"
 chrono = { workspace = true }
 async-nats = "0.38"
 async-trait = { workspace = true }
+toml = "0.8"
 dk-runner = { path = "../dk-runner" }
 dk-analytics = { workspace = true }
 
