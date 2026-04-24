@@ -1265,6 +1265,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tonic-build",
  "tracing",
